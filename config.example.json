@@ -1,0 +1,6 @@
+{
+  "api_id": 12345678,
+  "api_hash": "your_api_hash_here",
+  "download_path": "./downloads",
+  "max_concurrent_downloads": 3
+}

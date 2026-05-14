@@ -1,0 +1,13 @@
+config.json
+*.session
+*.session-journal
+tg_session*
+__pycache__/
+*.pyc
+*.pyo
+downloads/
+temp/
+.venv/
+venv/
+.env
+.DS_Store
