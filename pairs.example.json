@@ -1,0 +1,21 @@
+{
+  "interval_seconds": 3600,
+  "pairs": [
+    {
+      "name": "example-all",
+      "source": -1001234567890,
+      "dest": -1009876543210,
+      "type": "all",
+      "delay_seconds": 1.0,
+      "max_per_run": 200
+    },
+    {
+      "name": "example-docs-only",
+      "source": -1001111111111,
+      "dest": -1002222222222,
+      "type": "documents",
+      "delay_seconds": 1.5,
+      "max_per_run": 50
+    }
+  ]
+}

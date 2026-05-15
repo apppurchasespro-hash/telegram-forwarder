@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Optional, Callable
 
 from telethon import TelegramClient
+from telethon.sessions import StringSession
 from telethon.tl.functions.messages import GetForumTopicsRequest
 from telethon.tl.types import ForumTopic, MessageMediaWebPage, DocumentAttributeFilename
 from telethon.errors import FloodWaitError
@@ -27,11 +28,20 @@ BASE_DIR = Path(__file__).parent
 
 
 def load_config(config_path: str = None) -> dict:
+    # Env vars win — needed for cloud deployments (Railway, Docker, etc.)
+    if os.environ.get("TELEGRAM_API_ID") and os.environ.get("TELEGRAM_API_HASH"):
+        return {
+            "api_id": int(os.environ["TELEGRAM_API_ID"]),
+            "api_hash": os.environ["TELEGRAM_API_HASH"],
+            "download_path": os.environ.get("DOWNLOAD_PATH", "./downloads"),
+            "max_concurrent_downloads": int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", "3")),
+        }
     path = Path(config_path) if config_path else BASE_DIR / "config.json"
     if not path.exists():
         raise FileNotFoundError(
             f"Config file not found: {path}\n"
-            "Copy config.example.json to config.json and fill in your credentials."
+            "Copy config.example.json to config.json and fill in your credentials, "
+            "or set TELEGRAM_API_ID + TELEGRAM_API_HASH env vars."
         )
     with open(path, "r") as f:
         return json.load(f)
@@ -103,7 +113,11 @@ class TelegramDownloader:
         self.progress_tracker: dict[str, DownloadProgress] = {}
 
     async def start(self):
-        session = str(BASE_DIR / "tg_session")
+        session_string = os.environ.get("TELETHON_SESSION_STRING")
+        if session_string:
+            session = StringSession(session_string)
+        else:
+            session = str(BASE_DIR / "tg_session")
         self.client = TelegramClient(session, self.api_id, self.api_hash)
         await self.client.start()
         me = await self.client.get_me()

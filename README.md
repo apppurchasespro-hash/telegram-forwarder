@@ -17,6 +17,7 @@ Telegram's built-in forward fails on protected channels with `ChatForwardsRestri
 - Download media (documents, photos, videos) to local disk
 - Export message history to JSON
 - FloodWait-aware: sleeps when Telegram tells it to
+- **Long-running automation** (`automate.py`): config-driven (source, dest, type) pairs polled on an interval, watermark per pair so only new messages get copied. Includes Dockerfile + Railway config.
 
 ## Install
 
@@ -120,6 +121,73 @@ python cli.py export --chat -1001234567890 --output messages.json --limit 1000
 - **FloodWait is real.** If you blast a channel with thousands of forwards, Telegram will rate-limit you for minutes or hours. The default `--delay 1.0` is a safe starting point.
 - **Use a userbot account, not your main one, for heavy automation.** Telegram has banned accounts for aggressive forwarding patterns.
 - **Per Telegram ToS**, only forward content you have the right to redistribute. This tool is a transport — what you do with it is on you.
+
+## Automation (`automate.py`)
+
+`automate.py` is a long-running poller that copies only the new messages since each pair's last successful copy. State (per-pair watermarks) lives in `watermarks.json` — survives restarts.
+
+### Local
+
+```bash
+cp pairs.example.json pairs.json
+# edit pairs.json — set your (source, dest, type) pairs
+python automate.py
+```
+
+`pairs.json` schema:
+
+```json
+{
+  "interval_seconds": 3600,
+  "pairs": [
+    {
+      "name": "my-feed",
+      "source": -1001234567890,
+      "dest":   -1009876543210,
+      "type":   "all",
+      "delay_seconds": 1.0,
+      "max_per_run":   200
+    }
+  ]
+}
+```
+
+- `name` — unique key for the watermark. Don't change after first run.
+- `type` — `all`, `media`, `documents`, or `messages` (same as the CLI).
+- `max_per_run` — per-run cap; protects you from FloodWait if the source has a backlog.
+
+`RUN_ONCE_AND_EXIT=1 python automate.py` runs one pass and exits — useful for testing or one-shot cron jobs.
+
+### Deploy on Railway (24/7)
+
+This repo includes `Dockerfile` and `railway.json` for a one-service worker deployment.
+
+1. **Generate a session string locally** (one-time):
+
+   ```bash
+   # After logging in locally with the CLI at least once:
+   python convert_session.py > session_string.txt
+   ```
+
+   Treat `session_string.txt` like a password — it grants full account access.
+
+2. **Create a new Railway project** from this repo (`apppurchasespro-hash/telegram-forwarder`).
+
+3. **Set env vars** in the Railway service:
+
+   | Variable | Value |
+   |---|---|
+   | `TELEGRAM_API_ID` | from <https://my.telegram.org> |
+   | `TELEGRAM_API_HASH` | from <https://my.telegram.org> |
+   | `TELETHON_SESSION_STRING` | contents of `session_string.txt` |
+   | `PAIRS_JSON` | the entire JSON object from your `pairs.json` (inline) |
+   | `STATE_PATH` | `/app/data/watermarks.json` (set by the Dockerfile already) |
+
+4. **Add a Railway volume** mounted at `/app/data` so the watermark survives redeploys.
+
+5. **Deploy.** Tail the logs — you should see `Logged in as: ...` then a `no new messages` line within seconds, then `sleeping 3600s...`.
+
+The container runs `python automate.py`, which loops every `interval_seconds`.
 
 ## Troubleshooting
 
