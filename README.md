@@ -182,6 +182,7 @@ This repo includes `Dockerfile` and `railway.json` for a one-service worker depl
    | `TELETHON_SESSION_STRING` | contents of `session_string.txt` |
    | `PAIRS_JSON` | the entire JSON object from your `pairs.json` (inline) |
    | `STATE_PATH` | `/app/data/watermarks.json` (set by the Dockerfile already) |
+   | `INITIAL_WATERMARKS_JSON` *(optional)* | seed value applied on first boot if `STATE_PATH` doesn't yet exist — e.g. `{"my-feed":{"last_msg_id":12345}}`. Prevents re-forwarding history when redeploying. |
 
 4. **Add a Railway volume** mounted at `/app/data` so the watermark survives redeploys.
 

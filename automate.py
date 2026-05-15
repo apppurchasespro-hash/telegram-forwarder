@@ -55,6 +55,18 @@ def load_pairs() -> dict:
 def load_state() -> dict:
     path = _resolve_state_path()
     if not path.exists():
+        # First boot: seed from INITIAL_WATERMARKS_JSON if provided.
+        # Stops us from re-forwarding history when a deployment starts with
+        # an empty volume but the user has already copied messages elsewhere.
+        seed = os.environ.get("INITIAL_WATERMARKS_JSON")
+        if seed:
+            try:
+                state = json.loads(seed)
+                save_state(state)
+                print(f"Seeded watermarks from INITIAL_WATERMARKS_JSON ({len(state)} pairs)")
+                return state
+            except json.JSONDecodeError as e:
+                print(f"INITIAL_WATERMARKS_JSON is not valid JSON: {e}", file=sys.stderr)
         return {}
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
