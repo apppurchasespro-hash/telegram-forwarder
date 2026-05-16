@@ -67,19 +67,36 @@
             <span class="block text-xs text-slate-500 mb-1">Name (unique key for watermark)</span>
             <input name="name" required class="w-full border border-slate-300 rounded px-2 py-1">
           </label>
-          <label>
-            <span class="block text-xs text-slate-500 mb-1">Source chat ID</span>
-            <input name="source" required class="w-full border border-slate-300 rounded px-2 py-1 mono">
-          </label>
-          <label>
-            <span class="block text-xs text-slate-500 mb-1">Destination chat ID</span>
-            <input name="dest" required class="w-full border border-slate-300 rounded px-2 py-1 mono">
-          </label>
+          <div>
+            <label>
+              <span class="block text-xs text-slate-500 mb-1">Source chat ID</span>
+              <input name="source" data-topic-input="source" required class="w-full border border-slate-300 rounded px-2 py-1 mono">
+            </label>
+            <label class="mt-1 block">
+              <span class="block text-xs text-slate-500 mb-1">Source topic (forum supergroups only)</span>
+              <select name="source_topic" data-topic-select="source" class="w-full border border-slate-300 rounded px-2 py-1 text-xs">
+                <option value="">— none / not a forum —</option>
+              </select>
+            </label>
+          </div>
+          <div>
+            <label>
+              <span class="block text-xs text-slate-500 mb-1">Destination chat ID</span>
+              <input name="dest" data-topic-input="dest" required class="w-full border border-slate-300 rounded px-2 py-1 mono">
+            </label>
+            <label class="mt-1 block">
+              <span class="block text-xs text-slate-500 mb-1">Destination topic</span>
+              <select name="dest_topic" data-topic-select="dest" class="w-full border border-slate-300 rounded px-2 py-1 text-xs">
+                <option value="">— none / not a forum —</option>
+              </select>
+            </label>
+          </div>
           <label>
             <span class="block text-xs text-slate-500 mb-1">Type</span>
             <select name="type" class="w-full border border-slate-300 rounded px-2 py-1">
               <option value="all">all (text + media)</option>
-              <option value="documents">documents only</option>
+              <option value="docs_and_text">docs + text (skip photo/video)</option>
+              <option value="documents">documents only (incl. caption)</option>
               <option value="media">media only (photo/video)</option>
               <option value="messages">text only</option>
             </select>
@@ -121,18 +138,35 @@
         <h2 class="font-semibold mb-3">One-shot forward</h2>
         <p class="text-xs text-slate-500 mb-3">Forward the latest N messages now. Doesn't add a recurring pair, doesn't touch watermarks.</p>
         <form id="oneshot-form" class="grid grid-cols-2 gap-3 text-sm">
-          <label>
-            <span class="block text-xs text-slate-500 mb-1">Source ID</span>
-            <input name="source" required class="w-full border border-slate-300 rounded px-2 py-1 mono">
-          </label>
-          <label>
-            <span class="block text-xs text-slate-500 mb-1">Destination ID</span>
-            <input name="dest" required class="w-full border border-slate-300 rounded px-2 py-1 mono">
-          </label>
+          <div>
+            <label>
+              <span class="block text-xs text-slate-500 mb-1">Source ID</span>
+              <input name="source" data-topic-input="os-source" required class="w-full border border-slate-300 rounded px-2 py-1 mono">
+            </label>
+            <label class="mt-1 block">
+              <span class="block text-xs text-slate-500 mb-1">Source topic</span>
+              <select name="source_topic" data-topic-select="os-source" class="w-full border border-slate-300 rounded px-2 py-1 text-xs">
+                <option value="">— none / not a forum —</option>
+              </select>
+            </label>
+          </div>
+          <div>
+            <label>
+              <span class="block text-xs text-slate-500 mb-1">Destination ID</span>
+              <input name="dest" data-topic-input="os-dest" required class="w-full border border-slate-300 rounded px-2 py-1 mono">
+            </label>
+            <label class="mt-1 block">
+              <span class="block text-xs text-slate-500 mb-1">Destination topic</span>
+              <select name="dest_topic" data-topic-select="os-dest" class="w-full border border-slate-300 rounded px-2 py-1 text-xs">
+                <option value="">— none / not a forum —</option>
+              </select>
+            </label>
+          </div>
           <label>
             <span class="block text-xs text-slate-500 mb-1">Type</span>
             <select name="type" class="w-full border border-slate-300 rounded px-2 py-1">
               <option value="all">all</option>
+              <option value="docs_and_text">docs + text</option>
               <option value="documents">documents</option>
               <option value="media">media</option>
               <option value="messages">text only</option>
@@ -148,10 +182,21 @@
         </form>
       </div>
 
+      <!-- Running jobs -->
+      <div class="bg-white border border-slate-200 rounded-lg p-4">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="font-semibold">Active &amp; recent jobs</h2>
+          <span id="jobs-count" class="text-xs text-slate-500"></span>
+        </div>
+        <div id="jobs-list" class="space-y-2 text-sm max-h-[40vh] overflow-y-auto">
+          <p class="text-slate-400 text-xs">loading…</p>
+        </div>
+      </div>
+
       <!-- Run log -->
       <div class="bg-white border border-slate-200 rounded-lg p-4">
         <div class="flex items-center justify-between mb-3">
-          <h2 class="font-semibold">Recent runs</h2>
+          <h2 class="font-semibold">Recent events</h2>
           <button id="reload-runs" class="text-xs text-blue-600 hover:underline">refresh</button>
         </div>
         <div id="runs-list" class="space-y-1 text-xs mono max-h-[40vh] overflow-y-auto">
@@ -265,10 +310,13 @@ async function loadPairs() {
   try {
     const data = await api('/api/pairs');
     $('#interval-info').textContent = `interval: ${data.interval_seconds}s`;
-    const rows = (data.pairs || []).map(p => `
+    const rows = (data.pairs || []).map(p => {
+      const srcLabel = p.source_topic ? `${p.source}/t${p.source_topic}` : p.source;
+      const dstLabel = p.dest_topic ? `${p.dest}/t${p.dest_topic}` : p.dest;
+      return `
       <tr class="border-b last:border-b-0">
         <td class="py-1.5">${escapeHtml(p.name)}</td>
-        <td class="mono text-xs">${p.source} -> ${p.dest}</td>
+        <td class="mono text-xs">${srcLabel} -> ${dstLabel}</td>
         <td><span class="pill pill-channel">${p.type}</span></td>
         <td class="mono text-xs">#${p.watermark}</td>
         <td class="text-xs text-slate-500">${p.updated_at ? new Date(p.updated_at*1000).toLocaleString() : '—'}</td>
@@ -277,7 +325,7 @@ async function loadPairs() {
           <button data-pair="${escapeHtml(p.name)}" data-act="del" class="text-xs text-rose-600 hover:underline ml-2">delete</button>
         </td>
       </tr>
-    `).join('');
+    `;}).join('');
     $('#pairs-tbody').innerHTML = rows || '<tr><td colspan="6" class="text-slate-400 text-xs py-2">no pairs</td></tr>';
   } catch (e) {
     toast('Failed to load pairs: ' + e.message, false);
@@ -338,6 +386,109 @@ $('#oneshot-form').addEventListener('submit', async (e) => {
   }
 });
 
+// ── Topics ────────────────────────────────────────────────────────────
+const TOPIC_CACHE = new Map();
+async function loadTopicsFor(chatId, selectEl) {
+  if (!chatId || !/^-?\d+$/.test(chatId)) {
+    selectEl.innerHTML = '<option value="">— none / not a forum —</option>';
+    return;
+  }
+  if (TOPIC_CACHE.has(chatId)) {
+    renderTopics(selectEl, TOPIC_CACHE.get(chatId));
+    return;
+  }
+  try {
+    const r = await api(`/api/topics?chat=${encodeURIComponent(chatId)}`);
+    TOPIC_CACHE.set(chatId, r.topics || []);
+    renderTopics(selectEl, r.topics || []);
+  } catch (e) {
+    selectEl.innerHTML = '<option value="">— failed to load topics —</option>';
+  }
+}
+function renderTopics(selectEl, topics) {
+  const current = selectEl.value;
+  if (!topics.length) {
+    selectEl.innerHTML = '<option value="">— none / not a forum —</option>';
+    return;
+  }
+  selectEl.innerHTML = '<option value="">— main feed (no topic) —</option>' +
+    topics.map(t => `<option value="${t.id}">${escapeHtml(t.title)} (#${t.id})</option>`).join('');
+  selectEl.value = current; // preserve selection if still valid
+}
+
+// Wire each [data-topic-input] to its paired [data-topic-select]
+function wireTopicInputs() {
+  $$('[data-topic-input]').forEach(input => {
+    const key = input.dataset.topicInput;
+    const select = document.querySelector(`[data-topic-select="${key}"]`);
+    if (!select) return;
+    let debounce;
+    input.addEventListener('input', () => {
+      clearTimeout(debounce);
+      debounce = setTimeout(() => loadTopicsFor(input.value.trim(), select), 350);
+    });
+  });
+}
+wireTopicInputs();
+
+// ── Jobs ──────────────────────────────────────────────────────────────
+async function loadJobs() {
+  try {
+    const data = await api('/api/jobs');
+    const jobs = data.jobs || [];
+    const live = jobs.filter(j => j.status === 'running' || j.status === 'queued').length;
+    $('#jobs-count').textContent = `${live} running, ${jobs.length} total`;
+    const html = jobs.slice(0, 30).map(j => {
+      const pct = j.total ? Math.min(100, Math.round(100 * j.done / j.total)) : 0;
+      const pill = {
+        running: 'pill-running', queued: 'pill-running',
+        finished: 'pill-ok', cancelled: 'pill-err', error: 'pill-err',
+      }[j.status] || 'pill-channel';
+      const cancelBtn = (j.status === 'running' || j.status === 'queued')
+        ? `<button data-job="${j.id}" data-act="cancel" class="text-xs text-rose-600 hover:underline ml-2">cancel</button>`
+        : '';
+      const started = new Date(j.started_at * 1000).toLocaleTimeString();
+      return `
+        <div class="border border-slate-200 rounded p-2">
+          <div class="flex items-center justify-between gap-2 mb-1">
+            <div class="flex items-center gap-2 min-w-0">
+              <span class="pill ${pill}">${j.status}</span>
+              <span class="font-medium truncate">${escapeHtml(j.label)}</span>
+            </div>
+            <div class="text-xs text-slate-500 flex items-center">
+              <span>${j.done}/${j.total || '?'} (ok=${j.ok} fail=${j.fail})</span>
+              ${cancelBtn}
+            </div>
+          </div>
+          <div class="text-xs text-slate-500 flex items-center gap-2">
+            <span>${started}</span>
+            <div class="flex-1 bg-slate-100 rounded h-1.5">
+              <div class="bg-blue-500 h-1.5 rounded" style="width:${pct}%"></div>
+            </div>
+          </div>
+        </div>
+      `;
+    }).join('');
+    $('#jobs-list').innerHTML = html || '<p class="text-slate-400 text-xs">no jobs yet</p>';
+  } catch (e) {
+    /* keep silent — periodic */
+  }
+}
+$('#jobs-list').addEventListener('click', async (e) => {
+  const btn = e.target.closest('button[data-job]');
+  if (!btn) return;
+  if (btn.dataset.act === 'cancel') {
+    btn.disabled = true; btn.textContent = 'cancelling…';
+    try {
+      await api(`/api/jobs/${encodeURIComponent(btn.dataset.job)}/cancel`, { method: 'POST' });
+      toast('Cancel requested');
+      await loadJobs();
+    } catch (e) {
+      toast('Cancel failed: ' + e.message, false);
+    }
+  }
+});
+
 // ── Runs ──────────────────────────────────────────────────────────────
 async function loadRuns() {
   try {
@@ -363,7 +514,9 @@ $('#reload-runs').onclick = loadRuns;
 (async () => {
   await loadChats();
   await loadPairs();
+  await loadJobs();
   await loadRuns();
+  setInterval(loadJobs, 3000);   // tight — so progress bars feel live
   setInterval(loadRuns, 15000);
   setInterval(loadPairs, 30000);
 })();

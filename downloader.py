@@ -308,7 +308,9 @@ class TelegramDownloader:
 
     # ─── Copy (download + re-upload, bypasses restrictions) ──────
 
-    async def _copy_message_to(self, msg, dest_id: int | str) -> bool:
+    async def _copy_message_to(self, msg, dest_id: int | str, dest_topic: Optional[int] = None) -> bool:
+        # dest_topic: forum supergroup topic id. None or 1 = General/no topic.
+        reply_to = dest_topic if (dest_topic and dest_topic > 1) else None
         try:
             if msg.media and not isinstance(msg.media, MessageMediaWebPage):
                 temp_dir = BASE_DIR / "temp"
@@ -338,6 +340,8 @@ class TelegramDownloader:
                 if original_name:
                     send_kwargs["force_document"] = True
                     send_kwargs["attributes"] = [DocumentAttributeFilename(original_name)]
+                if reply_to:
+                    send_kwargs["reply_to"] = reply_to
                 await self.client.send_file(dest_id, temp_path, **send_kwargs)
                 try:
                     os.remove(temp_path)
@@ -348,6 +352,7 @@ class TelegramDownloader:
                     dest_id,
                     msg.message,
                     formatting_entities=msg.entities or None,
+                    reply_to=reply_to,
                 )
             else:
                 return False
@@ -355,7 +360,7 @@ class TelegramDownloader:
         except FloodWaitError as fw:
             print(f"\n  ⏳ Flood wait {fw.seconds}s...")
             await asyncio.sleep(fw.seconds)
-            return await self._copy_message_to(msg, dest_id)
+            return await self._copy_message_to(msg, dest_id, dest_topic=dest_topic)
         except Exception as e:
             print(f"\n  ✗ Failed msg #{msg.id}: {e}")
             return False

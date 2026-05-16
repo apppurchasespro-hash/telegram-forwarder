@@ -49,6 +49,39 @@ _run_log: list[dict] = []           # in-memory ring buffer
 _RUN_LOG_MAX = 500
 RUN_LOG_PATH = Path(os.environ.get("RUN_LOG_PATH", str(BASE_DIR / "run_log.json")))
 
+# Job registry — live + recently-finished jobs. status: queued|running|finished|cancelled|error
+_jobs: dict[str, dict] = {}
+_JOBS_MAX = 200
+_job_counter = 0
+
+
+def _new_job(kind: str, label: str, total: int = 0) -> dict:
+    global _job_counter
+    _job_counter += 1
+    job_id = f"job-{_job_counter}-{int(time.time())}"
+    job = {
+        "id": job_id,
+        "kind": kind,
+        "label": label,
+        "status": "queued",
+        "started_at": int(time.time()),
+        "finished_at": None,
+        "total": total,
+        "done": 0,
+        "ok": 0,
+        "fail": 0,
+        "last_id": None,
+        "cancel": False,
+    }
+    _jobs[job_id] = job
+    if len(_jobs) > _JOBS_MAX:
+        # Evict oldest finished jobs.
+        finished = [j for j in _jobs.values() if j["status"] in ("finished", "cancelled", "error")]
+        finished.sort(key=lambda j: j["finished_at"] or 0)
+        for j in finished[: len(_jobs) - _JOBS_MAX]:
+            _jobs.pop(j["id"], None)
+    return job
+
 
 def _log_event(event: dict) -> None:
     event = {"ts": int(time.time()), **event}
@@ -135,6 +168,27 @@ async def api_chats():
     return jsonify({"chats": chats})
 
 
+@app.route("/api/topics")
+async def api_topics():
+    """List forum topics for a chat. Returns {"topics": []} if the chat isn't
+    a forum supergroup (so the UI can hide the topic picker)."""
+    if not _dl:
+        return jsonify({"error": "telegram client not ready"}), 503
+    chat_id_str = request.args.get("chat")
+    if not chat_id_str:
+        return jsonify({"error": "chat parameter required"}), 400
+    try:
+        chat_id = int(chat_id_str)
+    except ValueError:
+        return jsonify({"error": "chat must be an integer"}), 400
+    try:
+        topics = await _dl.list_topics(chat_id)
+    except Exception:
+        # Not a forum, or no access — caller treats as "no topics".
+        return jsonify({"topics": []})
+    return jsonify({"topics": topics})
+
+
 # ───── Routes: pairs ──────────────────────────────────────────────────────
 
 
@@ -162,20 +216,28 @@ async def api_pairs_post():
     name = (body.get("name") or "").strip()
     if not name:
         return jsonify({"error": "name is required"}), 400
+    def _opt_int(v):
+        if v in (None, "", "null"):
+            return None
+        return int(v)
     try:
         new_pair = {
             "name": name,
             "source": int(body["source"]),
             "dest": int(body["dest"]),
+            "source_topic": _opt_int(body.get("source_topic")),
+            "dest_topic": _opt_int(body.get("dest_topic")),
             "type": body.get("type", "all"),
             "delay_seconds": float(body.get("delay_seconds", 1.0)),
             "max_per_run": int(body.get("max_per_run", 200)),
         }
+        # Drop nulls so JSON stays clean for users who don't use topics.
+        new_pair = {k: v for k, v in new_pair.items() if v is not None}
     except (KeyError, ValueError, TypeError) as e:
         return jsonify({"error": f"invalid pair: {e}"}), 400
 
-    if new_pair["type"] not in ("all", "media", "documents", "messages"):
-        return jsonify({"error": "type must be one of all|media|documents|messages"}), 400
+    if new_pair["type"] not in ("all", "media", "documents", "messages", "docs_and_text"):
+        return jsonify({"error": "type must be one of all|media|documents|messages|docs_and_text"}), 400
 
     async with _state_lock:
         cfg = load_pairs() if _pairs_file_exists() else {"interval_seconds": 3600, "pairs": []}
@@ -217,15 +279,18 @@ async def api_pair_run(name: str):
 
     async with _state_lock:
         state = load_state()
-    _log_event({"kind": "run_started", "pair": name, "trigger": "manual"})
+    job = _new_job(kind="pair-manual", label=f"pair:{name} (manual)")
+    _log_event({"kind": "run_started", "pair": name, "trigger": "manual", "job_id": job["id"]})
     try:
-        result = await run_pair(_dl, pair, state)
+        result = await run_pair(_dl, pair, state, job=job)
         async with _state_lock:
             save_state(state)
-        _log_event({"kind": "run_finished", "pair": name, "result": result, "trigger": "manual"})
-        return jsonify({"ok": True, "result": result})
+        job["finished_at"] = int(time.time())
+        _log_event({"kind": "run_finished", "pair": name, "result": result, "trigger": "manual", "job_id": job["id"]})
+        return jsonify({"ok": True, "result": result, "job_id": job["id"]})
     except Exception as e:
-        _log_event({"kind": "run_error", "pair": name, "error": str(e), "trigger": "manual"})
+        job.update({"status": "error", "finished_at": int(time.time())})
+        _log_event({"kind": "run_error", "pair": name, "error": str(e), "trigger": "manual", "job_id": job["id"]})
         return jsonify({"error": str(e)}), 500
 
 
@@ -237,43 +302,63 @@ async def api_forward_once():
     if not _dl:
         return jsonify({"error": "telegram client not ready"}), 503
     body = await request.get_json(force=True)
+    def _opt_int(v):
+        if v in (None, "", "null"):
+            return None
+        return int(v)
     try:
         source = int(body["source"])
         dest = int(body["dest"])
+        source_topic = _opt_int(body.get("source_topic"))
+        dest_topic = _opt_int(body.get("dest_topic"))
         ftype = body.get("type", "all")
         limit = int(body.get("limit", 50))
         delay = float(body.get("delay_seconds", 1.0))
     except (KeyError, ValueError, TypeError) as e:
         return jsonify({"error": f"invalid params: {e}"}), 400
 
-    _log_event({"kind": "oneshot_started", "source": source, "dest": dest, "type": ftype, "limit": limit})
+    job = _new_job(kind="oneshot", label=f"oneshot {source}->{dest}", total=limit)
+    _log_event({"kind": "oneshot_started", "source": source, "dest": dest, "type": ftype, "limit": limit, "job_id": job["id"]})
+
+    iter_kwargs = {"limit": limit or None}
+    if source_topic and source_topic > 1:
+        iter_kwargs["reply_to"] = source_topic
 
     msgs = []
-    async for m in _dl.client.iter_messages(source, limit=limit or None):
+    async for m in _dl.client.iter_messages(source, **iter_kwargs):
         if _matches_type(m, ftype, _dl):
             msgs.append(m)
     msgs.sort(key=lambda m: m.id)
     (BASE_DIR / "temp").mkdir(exist_ok=True)
 
+    job["total"] = len(msgs)
+    job["status"] = "running"
     ok = fail = 0
     try:
-        for m in msgs:
-            success = await _dl._copy_message_to(m, dest)
+        for i, m in enumerate(msgs, 1):
+            if job.get("cancel"):
+                job["status"] = "cancelled"
+                break
+            success = await _dl._copy_message_to(m, dest, dest_topic=dest_topic)
             if success:
                 ok += 1
             else:
                 fail += 1
+            job.update({"done": i, "ok": ok, "fail": fail, "last_id": m.id})
             await asyncio.sleep(delay)
+        if job["status"] != "cancelled":
+            job["status"] = "finished"
     finally:
+        job["finished_at"] = int(time.time())
         try:
             import shutil
             shutil.rmtree(BASE_DIR / "temp", ignore_errors=True)
         except Exception:
             pass
 
-    result = {"forwarded": ok, "failed": fail, "scanned": len(msgs)}
-    _log_event({"kind": "oneshot_finished", "source": source, "dest": dest, "result": result})
-    return jsonify({"ok": True, "result": result})
+    result = {"forwarded": ok, "failed": fail, "scanned": len(msgs), "cancelled": job["status"] == "cancelled"}
+    _log_event({"kind": "oneshot_finished", "source": source, "dest": dest, "result": result, "job_id": job["id"]})
+    return jsonify({"ok": True, "result": result, "job_id": job["id"]})
 
 
 # ───── Routes: run log ───────────────────────────────────────────────────
@@ -283,6 +368,30 @@ async def api_forward_once():
 async def api_runs():
     n = int(request.args.get("n", 50))
     return jsonify({"events": _run_log[-n:][::-1]})
+
+
+@app.route("/api/jobs")
+async def api_jobs():
+    """All recent jobs (live + finished). Filter with ?status=running for just live."""
+    status_filter = request.args.get("status")
+    jobs = list(_jobs.values())
+    if status_filter:
+        jobs = [j for j in jobs if j["status"] == status_filter]
+    jobs.sort(key=lambda j: j["started_at"], reverse=True)
+    # Strip the internal `cancel` flag from the response.
+    return jsonify({"jobs": [{k: v for k, v in j.items() if k != "cancel"} for j in jobs[:100]]})
+
+
+@app.route("/api/jobs/<job_id>/cancel", methods=["POST"])
+async def api_job_cancel(job_id: str):
+    job = _jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "job not found"}), 404
+    if job["status"] not in ("running", "queued"):
+        return jsonify({"error": f"job is {job['status']}, can't cancel"}), 400
+    job["cancel"] = True
+    _log_event({"kind": "job_cancel_requested", "job_id": job_id, "label": job["label"]})
+    return jsonify({"ok": True, "job": {k: v for k, v in job.items() if k != "cancel"}})
 
 
 # ───── Background scheduler ──────────────────────────────────────────────
@@ -295,17 +404,20 @@ async def _scheduler_loop():
             interval = max(60, int(cfg.get("interval_seconds", 3600)))
             for pair in cfg.get("pairs", []):
                 name = _pair_key(pair)
+                job = _new_job(kind="pair-scheduled", label=f"pair:{name} (scheduled)")
                 try:
                     async with _state_lock:
                         state = load_state()
-                    _log_event({"kind": "run_started", "pair": name, "trigger": "scheduler"})
-                    result = await run_pair(_dl, pair, state)
+                    _log_event({"kind": "run_started", "pair": name, "trigger": "scheduler", "job_id": job["id"]})
+                    result = await run_pair(_dl, pair, state, job=job)
                     async with _state_lock:
                         save_state(state)
-                    _log_event({"kind": "run_finished", "pair": name, "result": result, "trigger": "scheduler"})
+                    job["finished_at"] = int(time.time())
+                    _log_event({"kind": "run_finished", "pair": name, "result": result, "trigger": "scheduler", "job_id": job["id"]})
                 except Exception as e:
+                    job.update({"status": "error", "finished_at": int(time.time())})
                     print(f"scheduler error for {name}: {e}", file=sys.stderr)
-                    _log_event({"kind": "run_error", "pair": name, "error": str(e), "trigger": "scheduler"})
+                    _log_event({"kind": "run_error", "pair": name, "error": str(e), "trigger": "scheduler", "job_id": job["id"]})
             await asyncio.sleep(interval)
         except asyncio.CancelledError:
             raise

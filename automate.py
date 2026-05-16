@@ -108,22 +108,41 @@ def _matches_type(msg, ftype: str, dl: TelegramDownloader) -> bool:
         return dl._is_document(msg)
     if ftype == "messages":
         return bool(msg.message and not msg.media)
+    if ftype == "docs_and_text":
+        # documents (with or without caption) + text-only messages.
+        # Skips photos/videos/voice/etc.
+        return dl._is_document(msg) or bool(msg.message and not msg.media)
     return False
 
 
-async def run_pair(dl: TelegramDownloader, pair: dict, state: dict) -> dict:
+async def run_pair(dl: TelegramDownloader, pair: dict, state: dict, job: Optional[dict] = None) -> dict:
     name = _pair_key(pair)
     source = pair["source"]
     dest = pair["dest"]
+    source_topic = pair.get("source_topic")
+    dest_topic = pair.get("dest_topic")
     ftype = pair.get("type", "all")
     delay = float(pair.get("delay_seconds", 1.0))
     max_per_run = int(pair.get("max_per_run", 0)) or None
 
     watermark = int(state.get(name, {}).get("last_msg_id", 0))
-    print(f"[{name}] source={source} dest={dest} type={ftype} since=#{watermark}")
+    topic_note = ""
+    if source_topic:
+        topic_note += f" src_topic={source_topic}"
+    if dest_topic:
+        topic_note += f" dst_topic={dest_topic}"
+    print(f"[{name}] source={source} dest={dest} type={ftype}{topic_note} since=#{watermark}")
+
+    # Topic-aware iteration. reply_to=topic_id calls messages.getReplies and
+    # returns only that topic's messages. Topic id=1 ("General") doesn't carry
+    # reply_to, so server-side filter doesn't work — fall back to whole-chat
+    # iteration in that case (handled by caller setting source_topic to null).
+    iter_kwargs = {"min_id": watermark}
+    if source_topic and source_topic > 1:
+        iter_kwargs["reply_to"] = source_topic
 
     msgs = []
-    async for m in dl.client.iter_messages(source, min_id=watermark):
+    async for m in dl.client.iter_messages(source, **iter_kwargs):
         if _matches_type(m, ftype, dl):
             msgs.append(m)
 
@@ -133,15 +152,24 @@ async def run_pair(dl: TelegramDownloader, pair: dict, state: dict) -> dict:
 
     if not msgs:
         print(f"[{name}] no new messages")
+        if job:
+            job.update({"total": 0, "status": "finished"})
         return {"forwarded": 0, "failed": 0, "last_id": watermark}
 
     print(f"[{name}] copying {len(msgs)} new (#{msgs[0].id} -> #{msgs[-1].id})")
     (BASE_DIR / "temp").mkdir(exist_ok=True)
 
+    if job:
+        job.update({"total": len(msgs), "status": "running"})
+
     ok = fail = 0
     last_ok_id = watermark
     for i, m in enumerate(msgs, 1):
-        success = await dl._copy_message_to(m, dest)
+        if job and job.get("cancel"):
+            print(f"[{name}] cancelled at {i}/{len(msgs)}")
+            job["status"] = "cancelled"
+            break
+        success = await dl._copy_message_to(m, dest, dest_topic=dest_topic)
         if success:
             ok += 1
             last_ok_id = m.id
@@ -150,9 +178,13 @@ async def run_pair(dl: TelegramDownloader, pair: dict, state: dict) -> dict:
             save_state(state)
         else:
             fail += 1
+        if job:
+            job.update({"done": i, "ok": ok, "fail": fail, "last_id": last_ok_id})
         if i % 10 == 0 or i == len(msgs):
             print(f"[{name}] progress {i}/{len(msgs)} (ok={ok} fail={fail})")
         await asyncio.sleep(delay)
+    if job and job["status"] == "running":
+        job["status"] = "finished"
 
     try:
         import shutil
