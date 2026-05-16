@@ -17,7 +17,8 @@ Telegram's built-in forward fails on protected channels with `ChatForwardsRestri
 - Download media (documents, photos, videos) to local disk
 - Export message history to JSON
 - FloodWait-aware: sleeps when Telegram tells it to
-- **Long-running automation** (`automate.py`): config-driven (source, dest, type) pairs polled on an interval, watermark per pair so only new messages get copied. Includes Dockerfile + Railway config.
+- **Long-running automation** (`automate.py`): config-driven (source, dest, type) pairs polled on an interval, watermark per pair so only new messages get copied.
+- **Web UI** (`server.py`): browse chats, add/edit/delete recurring pairs, trigger one-shot forwards, view run history — all in one page behind HTTP Basic Auth. Includes Dockerfile + Railway config.
 
 ## Install
 
@@ -158,9 +159,32 @@ python automate.py
 
 `RUN_ONCE_AND_EXIT=1 python automate.py` runs one pass and exits — useful for testing or one-shot cron jobs.
 
+## Web UI (`server.py`)
+
+`server.py` is a Quart (async Flask) app that serves a single-page UI for managing forwards, plus the same hourly scheduler as `automate.py` running in the background.
+
+Local:
+
+```bash
+pip install -r requirements.txt
+export DASH_USER=admin
+export DASH_PASS=pick-a-strong-password
+python server.py
+# UI on http://localhost:5000
+```
+
+What you can do from the browser:
+- Browse all your chats with search/type filter; click to fill the source or dest field
+- Add, edit, delete recurring pairs
+- Trigger "Run now" on a single pair without waiting for the next interval
+- Send a one-shot forward (latest N messages of a given type) — doesn't touch watermarks
+- See the run log (manual + scheduled events, with errors)
+
+Auth: HTTP Basic Auth using `DASH_USER` + `DASH_PASS` env vars. If `DASH_PASS` is unset, auth is **disabled** (only do that for local dev).
+
 ### Deploy on Railway (24/7)
 
-This repo includes `Dockerfile` and `railway.json` for a one-service worker deployment.
+This repo includes `Dockerfile` and `railway.json` for a one-service deployment that runs both the UI and the scheduler.
 
 1. **Generate a session string locally** (one-time):
 
@@ -180,15 +204,21 @@ This repo includes `Dockerfile` and `railway.json` for a one-service worker depl
    | `TELEGRAM_API_ID` | from <https://my.telegram.org> |
    | `TELEGRAM_API_HASH` | from <https://my.telegram.org> |
    | `TELETHON_SESSION_STRING` | contents of `session_string.txt` |
-   | `PAIRS_JSON` | the entire JSON object from your `pairs.json` (inline) |
+   | `PAIRS_JSON` *(optional)* | inline JSON pair config; seeds `/app/data/pairs.json` on first boot if missing. After that, manage pairs via the UI. |
    | `STATE_PATH` | `/app/data/watermarks.json` (set by the Dockerfile already) |
+   | `PAIRS_PATH` | `/app/data/pairs.json` (set by the Dockerfile already) |
+   | `RUN_LOG_PATH` | `/app/data/run_log.json` (set by the Dockerfile already) |
    | `INITIAL_WATERMARKS_JSON` *(optional)* | seed value applied on first boot if `STATE_PATH` doesn't yet exist — e.g. `{"my-feed":{"last_msg_id":12345}}`. Prevents re-forwarding history when redeploying. |
+   | `DASH_USER` | username for the web UI Basic Auth |
+   | `DASH_PASS` | password for the web UI Basic Auth (set this — if unset, UI is open) |
 
-4. **Add a Railway volume** mounted at `/app/data` so the watermark survives redeploys.
+4. **Add a Railway volume** mounted at `/app/data` so pairs + watermarks + run log survive redeploys.
 
-5. **Deploy.** Tail the logs — you should see `Logged in as: ...` then a `no new messages` line within seconds, then `sleeping 3600s...`.
+5. **Expose a public domain.** After the first deploy, run `railway domain` (or use the UI) to generate a `*.up.railway.app` URL.
 
-The container runs `python automate.py`, which loops every `interval_seconds`.
+6. **Deploy.** Tail the logs — you should see `Logged in as: ...` then `server ready` and the UI will be reachable at the public domain. Browser will prompt for `DASH_USER`/`DASH_PASS`.
+
+The container runs `python server.py`, which serves the UI and runs the scheduler in the same process.
 
 ## Troubleshooting
 

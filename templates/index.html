@@ -1,0 +1,372 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Telegram Forwarder</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: 'Inter', system-ui, -apple-system, sans-serif; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    .pill { display: inline-block; padding: 1px 7px; border-radius: 9999px; font-size: 11px; font-weight: 500; }
+    .pill-channel { background:#dbeafe; color:#1e3a8a; }
+    .pill-supergroup { background:#fef3c7; color:#92400e; }
+    .pill-group { background:#fef3c7; color:#92400e; }
+    .pill-private { background:#f3e8ff; color:#5b21b6; }
+    .pill-ok { background:#dcfce7; color:#166534; }
+    .pill-err { background:#fee2e2; color:#991b1b; }
+    .pill-running { background:#dbeafe; color:#1e3a8a; }
+    .toast { position:fixed; bottom:20px; right:20px; padding:12px 16px; border-radius:8px; box-shadow:0 4px 12px rgba(0,0,0,.15); z-index:50; }
+    .toast-ok { background:#dcfce7; color:#166534; }
+    .toast-err { background:#fee2e2; color:#991b1b; }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-900">
+  <header class="bg-white border-b border-slate-200 sticky top-0 z-10">
+    <div class="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between">
+      <div>
+        <h1 class="text-lg font-semibold">Telegram Forwarder</h1>
+        <p class="text-xs text-slate-500">Manage forwards, list chats, run on demand</p>
+      </div>
+      <div class="text-xs text-slate-500">
+        <span id="status-dot" class="inline-block w-2 h-2 rounded-full bg-slate-300 mr-1"></span>
+        <span id="status-text">connecting…</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="max-w-7xl mx-auto p-4 grid gap-4 grid-cols-1 lg:grid-cols-3">
+
+    <!-- Chats -->
+    <section class="lg:col-span-1 bg-white border border-slate-200 rounded-lg p-4">
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="font-semibold">Your chats</h2>
+        <button id="reload-chats" class="text-xs text-blue-600 hover:underline">refresh</button>
+      </div>
+      <input id="chat-search" type="text" placeholder="search by name or id…"
+             class="w-full border border-slate-300 rounded px-2 py-1 text-sm mb-3">
+      <div class="flex gap-1 mb-2 text-xs">
+        <button data-filter="all" class="filter-btn px-2 py-0.5 rounded bg-slate-200">all</button>
+        <button data-filter="channel" class="filter-btn px-2 py-0.5 rounded bg-slate-100">channels</button>
+        <button data-filter="supergroup" class="filter-btn px-2 py-0.5 rounded bg-slate-100">groups</button>
+        <button data-filter="private" class="filter-btn px-2 py-0.5 rounded bg-slate-100">private</button>
+      </div>
+      <div id="chats-list" class="space-y-1 max-h-[60vh] overflow-y-auto text-sm">
+        <p class="text-slate-400 text-xs">loading…</p>
+      </div>
+    </section>
+
+    <!-- Right column: pairs, one-shot, runs -->
+    <section class="lg:col-span-2 space-y-4">
+
+      <!-- Add/Edit Pair -->
+      <div class="bg-white border border-slate-200 rounded-lg p-4">
+        <h2 class="font-semibold mb-3">Recurring pair</h2>
+        <form id="pair-form" class="grid grid-cols-2 gap-3 text-sm">
+          <label class="col-span-2">
+            <span class="block text-xs text-slate-500 mb-1">Name (unique key for watermark)</span>
+            <input name="name" required class="w-full border border-slate-300 rounded px-2 py-1">
+          </label>
+          <label>
+            <span class="block text-xs text-slate-500 mb-1">Source chat ID</span>
+            <input name="source" required class="w-full border border-slate-300 rounded px-2 py-1 mono">
+          </label>
+          <label>
+            <span class="block text-xs text-slate-500 mb-1">Destination chat ID</span>
+            <input name="dest" required class="w-full border border-slate-300 rounded px-2 py-1 mono">
+          </label>
+          <label>
+            <span class="block text-xs text-slate-500 mb-1">Type</span>
+            <select name="type" class="w-full border border-slate-300 rounded px-2 py-1">
+              <option value="all">all (text + media)</option>
+              <option value="documents">documents only</option>
+              <option value="media">media only (photo/video)</option>
+              <option value="messages">text only</option>
+            </select>
+          </label>
+          <label>
+            <span class="block text-xs text-slate-500 mb-1">Max per run</span>
+            <input name="max_per_run" type="number" value="200" min="1" class="w-full border border-slate-300 rounded px-2 py-1">
+          </label>
+          <label>
+            <span class="block text-xs text-slate-500 mb-1">Delay between sends (s)</span>
+            <input name="delay_seconds" type="number" value="1.0" step="0.1" min="0" class="w-full border border-slate-300 rounded px-2 py-1">
+          </label>
+          <label>
+            <span class="block text-xs text-slate-500 mb-1">Run interval (s, applies globally)</span>
+            <input name="interval_seconds" type="number" value="3600" min="60" class="w-full border border-slate-300 rounded px-2 py-1">
+          </label>
+          <div class="col-span-2 flex justify-end">
+            <button type="submit" class="bg-blue-600 hover:bg-blue-700 text-white text-sm px-4 py-1.5 rounded">Save pair</button>
+          </div>
+        </form>
+      </div>
+
+      <!-- Current pairs -->
+      <div class="bg-white border border-slate-200 rounded-lg p-4">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="font-semibold">Active pairs</h2>
+          <span id="interval-info" class="text-xs text-slate-500"></span>
+        </div>
+        <table class="w-full text-sm">
+          <thead class="text-xs text-slate-500 border-b">
+            <tr><th class="text-left py-1">Name</th><th class="text-left">Source -> Dest</th><th>Type</th><th>Watermark</th><th>Last run</th><th></th></tr>
+          </thead>
+          <tbody id="pairs-tbody"><tr><td colspan="6" class="text-slate-400 text-xs py-2">loading…</td></tr></tbody>
+        </table>
+      </div>
+
+      <!-- One-shot forward -->
+      <div class="bg-white border border-slate-200 rounded-lg p-4">
+        <h2 class="font-semibold mb-3">One-shot forward</h2>
+        <p class="text-xs text-slate-500 mb-3">Forward the latest N messages now. Doesn't add a recurring pair, doesn't touch watermarks.</p>
+        <form id="oneshot-form" class="grid grid-cols-2 gap-3 text-sm">
+          <label>
+            <span class="block text-xs text-slate-500 mb-1">Source ID</span>
+            <input name="source" required class="w-full border border-slate-300 rounded px-2 py-1 mono">
+          </label>
+          <label>
+            <span class="block text-xs text-slate-500 mb-1">Destination ID</span>
+            <input name="dest" required class="w-full border border-slate-300 rounded px-2 py-1 mono">
+          </label>
+          <label>
+            <span class="block text-xs text-slate-500 mb-1">Type</span>
+            <select name="type" class="w-full border border-slate-300 rounded px-2 py-1">
+              <option value="all">all</option>
+              <option value="documents">documents</option>
+              <option value="media">media</option>
+              <option value="messages">text only</option>
+            </select>
+          </label>
+          <label>
+            <span class="block text-xs text-slate-500 mb-1">Limit (latest N)</span>
+            <input name="limit" type="number" value="50" min="1" max="2000" class="w-full border border-slate-300 rounded px-2 py-1">
+          </label>
+          <div class="col-span-2 flex justify-end">
+            <button type="submit" class="bg-emerald-600 hover:bg-emerald-700 text-white text-sm px-4 py-1.5 rounded">Forward now</button>
+          </div>
+        </form>
+      </div>
+
+      <!-- Run log -->
+      <div class="bg-white border border-slate-200 rounded-lg p-4">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="font-semibold">Recent runs</h2>
+          <button id="reload-runs" class="text-xs text-blue-600 hover:underline">refresh</button>
+        </div>
+        <div id="runs-list" class="space-y-1 text-xs mono max-h-[40vh] overflow-y-auto">
+          <p class="text-slate-400">loading…</p>
+        </div>
+      </div>
+
+    </section>
+  </main>
+
+  <div id="toast-host"></div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const $$ = (s) => Array.from(document.querySelectorAll(s));
+let CHATS = [];
+let FILTER = 'all';
+
+function toast(msg, ok = true) {
+  const el = document.createElement('div');
+  el.className = `toast ${ok ? 'toast-ok' : 'toast-err'}`;
+  el.textContent = msg;
+  $('#toast-host').appendChild(el);
+  setTimeout(() => el.remove(), 3500);
+}
+
+function setStatus(ok, text) {
+  $('#status-dot').className = `inline-block w-2 h-2 rounded-full mr-1 ${ok ? 'bg-emerald-500' : 'bg-rose-500'}`;
+  $('#status-text').textContent = text;
+}
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, {
+    headers: { 'Content-Type': 'application/json' },
+    ...opts,
+  });
+  if (!r.ok) {
+    const txt = await r.text();
+    throw new Error(`${r.status}: ${txt}`);
+  }
+  return r.json();
+}
+
+// ── Chats ─────────────────────────────────────────────────────────────
+async function loadChats() {
+  try {
+    const data = await api('/api/chats?limit=400');
+    CHATS = data.chats || [];
+    renderChats();
+    setStatus(true, `${CHATS.length} chats loaded`);
+  } catch (e) {
+    setStatus(false, 'offline');
+    toast('Failed to load chats: ' + e.message, false);
+  }
+}
+
+function renderChats() {
+  const q = $('#chat-search').value.toLowerCase().trim();
+  const filtered = CHATS.filter(c => {
+    if (FILTER !== 'all' && c.type !== FILTER) return false;
+    if (!q) return true;
+    return (c.title || '').toLowerCase().includes(q) || String(c.id).includes(q);
+  });
+  const html = filtered.slice(0, 200).map(c => `
+    <div class="flex items-center justify-between gap-2 p-2 rounded hover:bg-slate-50">
+      <div class="min-w-0 flex-1">
+        <div class="font-medium truncate">${escapeHtml(c.title || '?')}</div>
+        <div class="text-xs text-slate-500 mono">${c.id} <span class="pill pill-${c.type}">${c.type}</span></div>
+      </div>
+      <div class="flex gap-1">
+        <button data-act="copy" data-id="${c.id}" class="text-xs text-slate-600 hover:text-slate-900 px-2 py-0.5 border border-slate-200 rounded">copy id</button>
+        <button data-act="src" data-id="${c.id}" class="text-xs text-blue-600 hover:underline">-> source</button>
+        <button data-act="dst" data-id="${c.id}" class="text-xs text-emerald-600 hover:underline">-> dest</button>
+      </div>
+    </div>
+  `).join('');
+  $('#chats-list').innerHTML = html || '<p class="text-slate-400 text-xs">no matches</p>';
+}
+
+$('#chats-list').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-act]');
+  if (!btn) return;
+  const id = btn.dataset.id;
+  if (btn.dataset.act === 'copy') {
+    navigator.clipboard.writeText(id);
+    toast(`Copied ${id}`);
+  } else if (btn.dataset.act === 'src') {
+    document.querySelector('#pair-form [name=source]').value = id;
+    document.querySelector('#oneshot-form [name=source]').value = id;
+  } else if (btn.dataset.act === 'dst') {
+    document.querySelector('#pair-form [name=dest]').value = id;
+    document.querySelector('#oneshot-form [name=dest]').value = id;
+  }
+});
+
+$('#reload-chats').onclick = loadChats;
+$('#chat-search').addEventListener('input', renderChats);
+$$('.filter-btn').forEach(b => b.addEventListener('click', () => {
+  FILTER = b.dataset.filter;
+  $$('.filter-btn').forEach(x => x.classList.replace('bg-slate-200','bg-slate-100'));
+  b.classList.replace('bg-slate-100','bg-slate-200');
+  renderChats();
+}));
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// ── Pairs ─────────────────────────────────────────────────────────────
+async function loadPairs() {
+  try {
+    const data = await api('/api/pairs');
+    $('#interval-info').textContent = `interval: ${data.interval_seconds}s`;
+    const rows = (data.pairs || []).map(p => `
+      <tr class="border-b last:border-b-0">
+        <td class="py-1.5">${escapeHtml(p.name)}</td>
+        <td class="mono text-xs">${p.source} -> ${p.dest}</td>
+        <td><span class="pill pill-channel">${p.type}</span></td>
+        <td class="mono text-xs">#${p.watermark}</td>
+        <td class="text-xs text-slate-500">${p.updated_at ? new Date(p.updated_at*1000).toLocaleString() : '—'}</td>
+        <td class="text-right">
+          <button data-pair="${escapeHtml(p.name)}" data-act="run" class="text-xs text-blue-600 hover:underline">run</button>
+          <button data-pair="${escapeHtml(p.name)}" data-act="del" class="text-xs text-rose-600 hover:underline ml-2">delete</button>
+        </td>
+      </tr>
+    `).join('');
+    $('#pairs-tbody').innerHTML = rows || '<tr><td colspan="6" class="text-slate-400 text-xs py-2">no pairs</td></tr>';
+  } catch (e) {
+    toast('Failed to load pairs: ' + e.message, false);
+  }
+}
+
+$('#pairs-tbody').addEventListener('click', async (e) => {
+  const btn = e.target.closest('button[data-pair]');
+  if (!btn) return;
+  const name = btn.dataset.pair;
+  if (btn.dataset.act === 'run') {
+    btn.disabled = true; btn.textContent = 'running…';
+    try {
+      const r = await api(`/api/pairs/${encodeURIComponent(name)}/run`, { method: 'POST' });
+      toast(`[${name}] forwarded=${r.result.forwarded} failed=${r.result.failed}`);
+      await loadPairs(); await loadRuns();
+    } catch (e) {
+      toast('Run failed: ' + e.message, false);
+    } finally {
+      btn.disabled = false; btn.textContent = 'run';
+    }
+  } else if (btn.dataset.act === 'del') {
+    if (!confirm(`Delete pair "${name}"?\n(Watermark is kept — re-adding the pair won't re-forward history.)`)) return;
+    await api(`/api/pairs/${encodeURIComponent(name)}`, { method: 'DELETE' });
+    toast(`Deleted ${name}`);
+    await loadPairs();
+  }
+});
+
+$('#pair-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const body = Object.fromEntries(fd.entries());
+  try {
+    const r = await api('/api/pairs', { method: 'POST', body: JSON.stringify(body) });
+    toast(`Pair ${r.action}: ${r.pair.name}`);
+    await loadPairs();
+  } catch (e) {
+    toast('Save failed: ' + e.message, false);
+  }
+});
+
+// ── One-shot ──────────────────────────────────────────────────────────
+$('#oneshot-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const body = Object.fromEntries(fd.entries());
+  const btn = e.target.querySelector('button[type=submit]');
+  btn.disabled = true; btn.textContent = 'forwarding…';
+  try {
+    const r = await api('/api/forward-once', { method: 'POST', body: JSON.stringify(body) });
+    toast(`Scanned ${r.result.scanned}, forwarded ${r.result.forwarded}, failed ${r.result.failed}`);
+    await loadRuns();
+  } catch (e) {
+    toast('Forward failed: ' + e.message, false);
+  } finally {
+    btn.disabled = false; btn.textContent = 'Forward now';
+  }
+});
+
+// ── Runs ──────────────────────────────────────────────────────────────
+async function loadRuns() {
+  try {
+    const data = await api('/api/runs?n=60');
+    const rows = (data.events || []).map(ev => {
+      const dt = new Date(ev.ts * 1000).toLocaleTimeString();
+      let line = `${dt} • ${ev.kind}`;
+      if (ev.pair) line += ` • ${ev.pair}`;
+      if (ev.trigger) line += ` [${ev.trigger}]`;
+      if (ev.result) line += ` -> ok=${ev.result.forwarded} fail=${ev.result.failed}`;
+      if (ev.error) line += ` ERROR: ${ev.error}`;
+      const colour = ev.kind.includes('error') ? 'text-rose-600' : ev.kind.includes('finished') ? 'text-emerald-700' : 'text-slate-600';
+      return `<div class="${colour}">${escapeHtml(line)}</div>`;
+    }).join('');
+    $('#runs-list').innerHTML = rows || '<p class="text-slate-400">no events yet</p>';
+  } catch (e) {
+    toast('Failed to load runs: ' + e.message, false);
+  }
+}
+$('#reload-runs').onclick = loadRuns;
+
+// ── Init ──────────────────────────────────────────────────────────────
+(async () => {
+  await loadChats();
+  await loadPairs();
+  await loadRuns();
+  setInterval(loadRuns, 15000);
+  setInterval(loadPairs, 30000);
+})();
+</script>
+</body>
+</html>

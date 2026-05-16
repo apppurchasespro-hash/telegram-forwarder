@@ -1,6 +1,7 @@
 config.json
 pairs.json
 watermarks.json
+run_log.json
 .pairs_from_env.json
 *.session
 *.session-journal

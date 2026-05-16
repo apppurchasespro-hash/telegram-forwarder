@@ -15,6 +15,11 @@ RUN pip install -r requirements.txt
 
 COPY . .
 
-ENV STATE_PATH=/app/data/watermarks.json
+ENV STATE_PATH=/app/data/watermarks.json \
+    PAIRS_PATH=/app/data/pairs.json \
+    RUN_LOG_PATH=/app/data/run_log.json \
+    PORT=8080
 
-CMD ["python", "automate.py"]
+EXPOSE 8080
+
+CMD ["python", "server.py"]

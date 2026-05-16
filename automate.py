@@ -26,15 +26,8 @@ DEFAULT_STATE = BASE_DIR / "watermarks.json"
 
 
 def _resolve_pairs_path() -> Path:
-    env = os.environ.get("PAIRS_JSON")
-    if env:
-        # Env var can be either a file path or a JSON literal.
-        if env.lstrip().startswith("{"):
-            tmp = BASE_DIR / ".pairs_from_env.json"
-            tmp.write_text(env, encoding="utf-8")
-            return tmp
-        return Path(env)
-    return DEFAULT_PAIRS
+    # PAIRS_PATH wins (cloud volume), else local default.
+    return Path(os.environ.get("PAIRS_PATH", str(DEFAULT_PAIRS)))
 
 
 def _resolve_state_path() -> Path:
@@ -44,12 +37,33 @@ def _resolve_state_path() -> Path:
 def load_pairs() -> dict:
     path = _resolve_pairs_path()
     if not path.exists():
+        # First boot: seed from PAIRS_JSON env var if provided (inline JSON).
+        # Lets a fresh container start with a known pair config.
+        seed = os.environ.get("PAIRS_JSON")
+        if seed and seed.lstrip().startswith("{"):
+            try:
+                cfg = json.loads(seed)
+                save_pairs(cfg)
+                print(f"Seeded pairs from PAIRS_JSON ({len(cfg.get('pairs', []))} pairs)")
+                return cfg
+            except json.JSONDecodeError as e:
+                print(f"PAIRS_JSON is not valid JSON: {e}", file=sys.stderr)
+                raise
         raise FileNotFoundError(
             f"Pairs config not found: {path}. Copy pairs.example.json to pairs.json, "
-            "or set the PAIRS_JSON env var (path or inline JSON)."
+            "or set the PAIRS_JSON env var (inline JSON, seeds the file)."
         )
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def save_pairs(cfg: dict) -> None:
+    path = _resolve_pairs_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, sort_keys=True)
+    tmp.replace(path)
 
 
 def load_state() -> dict:
