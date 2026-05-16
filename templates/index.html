@@ -182,6 +182,48 @@
         </form>
       </div>
 
+      <!-- Clone forum end-to-end -->
+      <div class="bg-white border border-slate-200 rounded-lg p-4">
+        <h2 class="font-semibold mb-1">Clone forum end-to-end</h2>
+        <p class="text-xs text-slate-500 mb-3">
+          One click: creates a new private supergroup with topics enabled,
+          mirrors every topic from the source, and registers one recurring
+          pair per topic. Doesn't backfill — click "run" on each pair
+          afterwards (or wait for the scheduler).
+        </p>
+        <form id="clone-form" class="grid grid-cols-2 gap-3 text-sm">
+          <label class="col-span-2">
+            <span class="block text-xs text-slate-500 mb-1">Source forum chat ID</span>
+            <input name="source" required class="w-full border border-slate-300 rounded px-2 py-1 mono" placeholder="-100…">
+          </label>
+          <label class="col-span-2">
+            <span class="block text-xs text-slate-500 mb-1">New destination title</span>
+            <input name="dest_title" required class="w-full border border-slate-300 rounded px-2 py-1" placeholder="e.g. Elite Hacking Training (mirror)">
+          </label>
+          <label>
+            <span class="block text-xs text-slate-500 mb-1">Type (applied to all generated pairs)</span>
+            <select name="type" class="w-full border border-slate-300 rounded px-2 py-1">
+              <option value="all">all</option>
+              <option value="docs_and_text">docs + text</option>
+              <option value="documents">documents</option>
+              <option value="media">media</option>
+              <option value="messages">text only</option>
+            </select>
+          </label>
+          <label>
+            <span class="block text-xs text-slate-500 mb-1">Max per run (per pair)</span>
+            <input name="max_per_run" type="number" value="200" min="1" class="w-full border border-slate-300 rounded px-2 py-1">
+          </label>
+          <label class="col-span-2 flex items-center gap-2 text-xs text-slate-600">
+            <input name="skip_general" type="checkbox" checked class="rounded">
+            Skip General topic (recommended — Telegram doesn't allow filtering source by reply_to=1)
+          </label>
+          <div class="col-span-2 flex justify-end">
+            <button type="submit" class="bg-purple-600 hover:bg-purple-700 text-white text-sm px-4 py-1.5 rounded">Create clone</button>
+          </div>
+        </form>
+      </div>
+
       <!-- Running jobs -->
       <div class="bg-white border border-slate-200 rounded-lg p-4">
         <div class="flex items-center justify-between mb-3">
@@ -383,6 +425,33 @@ $('#oneshot-form').addEventListener('submit', async (e) => {
     toast('Forward failed: ' + e.message, false);
   } finally {
     btn.disabled = false; btn.textContent = 'Forward now';
+  }
+});
+
+// ── Clone forum ───────────────────────────────────────────────────────
+$('#clone-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const body = Object.fromEntries(fd.entries());
+  body.skip_general = e.target.skip_general.checked;
+  if (!confirm(
+    `Create a new private supergroup titled "${body.dest_title}" and mirror every topic from source ${body.source}?\n\n` +
+    `This creates a real chat under your Telegram account. Undoing means deleting the group manually in the app.`
+  )) return;
+  const btn = e.target.querySelector('button[type=submit]');
+  btn.disabled = true; btn.textContent = 'cloning…';
+  try {
+    const r = await api('/api/clone-forum', { method: 'POST', body: JSON.stringify(body) });
+    const res = r.result;
+    toast(`Created ${res.dest_chat_id} with ${res.topics_created} topics, ${res.pairs_added.length} pairs added`);
+    await loadPairs(); await loadJobs(); await loadRuns();
+    // Clear the form on success.
+    e.target.reset();
+    e.target.skip_general.checked = true;
+  } catch (e) {
+    toast('Clone failed: ' + e.message, false);
+  } finally {
+    btn.disabled = false; btn.textContent = 'Create clone';
   }
 });
 

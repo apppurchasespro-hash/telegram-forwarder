@@ -13,6 +13,7 @@ One Quart app that:
 import asyncio
 import json
 import os
+import re
 import secrets
 import sys
 import time
@@ -21,6 +22,10 @@ from pathlib import Path
 from typing import Optional
 
 from quart import Quart, request, jsonify, render_template, Response
+
+from telethon import utils as tg_utils
+from telethon.tl.functions.channels import CreateChannelRequest, ToggleForumRequest
+from telethon.tl.functions.messages import CreateForumTopicRequest
 
 from downloader import TelegramDownloader, load_config
 from automate import (
@@ -359,6 +364,156 @@ async def api_forward_once():
     result = {"forwarded": ok, "failed": fail, "scanned": len(msgs), "cancelled": job["status"] == "cancelled"}
     _log_event({"kind": "oneshot_finished", "source": source, "dest": dest, "result": result, "job_id": job["id"]})
     return jsonify({"ok": True, "result": result, "job_id": job["id"]})
+
+
+# ───── Routes: clone forum end-to-end ───────────────────────────────────
+
+
+def _slug(s: str, fallback: str = "x", maxlen: int = 40) -> str:
+    s = re.sub(r"[^a-zA-Z0-9]+", "-", (s or "").lower()).strip("-")
+    return (s or fallback)[:maxlen]
+
+
+async def _clone_forum_impl(*, source_id: int, dest_title: str, skip_general: bool,
+                            ftype: str, delay_seconds: float, max_per_run: int,
+                            job: dict) -> dict:
+    """Create dest forum, mirror topics, write pairs.json. Mutates `job` for progress."""
+    # 1. Validate source — list_topics raises if not a forum / no access.
+    src_topics = await _dl.list_topics(source_id)
+    if not src_topics:
+        raise ValueError(f"source chat {source_id} is not a forum supergroup, or has no topics")
+
+    to_clone = [t for t in src_topics if not (skip_general and t["id"] == 1)]
+    skipped = [t["title"] for t in src_topics if (skip_general and t["id"] == 1)]
+    job["total"] = len(to_clone)
+
+    # 2. Create destination supergroup with forum flag.
+    create_result = await _dl.client(CreateChannelRequest(
+        title=dest_title,
+        about="",
+        megagroup=True,
+        forum=True,
+    ))
+    dest_channel = create_result.chats[0]
+    dest_chat_id = tg_utils.get_peer_id(dest_channel)
+
+    # If forum flag didn't take (older Telegram cores), toggle explicitly.
+    if not getattr(dest_channel, "forum", False):
+        try:
+            await _dl.client(ToggleForumRequest(channel=dest_channel, enabled=True, tabs=False))
+        except Exception as e:
+            print(f"ToggleForum failed (may be benign): {e}", file=sys.stderr)
+
+    dest_peer = await _dl.client.get_input_entity(dest_chat_id)
+
+    # 3. Create matching topics, throttled to avoid FloodWait.
+    for idx, st in enumerate(to_clone, 1):
+        if job.get("cancel"):
+            job["status"] = "cancelled"
+            break
+        try:
+            await _dl.client(CreateForumTopicRequest(
+                peer=dest_peer,
+                title=st["title"],
+                random_id=secrets.randbits(63),
+            ))
+            job["ok"] += 1
+        except Exception as e:
+            job["fail"] += 1
+            print(f"failed to create topic {st['title']!r}: {e}", file=sys.stderr)
+        job["done"] = idx
+        await asyncio.sleep(0.5)  # gentle throttle
+
+    # 4. List dest topics to resolve title -> id, then write pairs.
+    new_topics = await _dl.list_topics(dest_chat_id)
+    # First occurrence wins (Telegram permits duplicate titles; src shouldn't have any).
+    title_to_id = {}
+    for t in new_topics:
+        title_to_id.setdefault(t["title"], t["id"])
+
+    dest_slug = _slug(dest_title, fallback="clone")
+    pairs_added = []
+    pairs_missing = []
+
+    async with _state_lock:
+        cfg = load_pairs() if _pairs_file_exists() else {"interval_seconds": 3600, "pairs": []}
+        existing_names = {p.get("name") for p in cfg.get("pairs", [])}
+
+        for st in to_clone:
+            dest_topic_id = title_to_id.get(st["title"])
+            if not dest_topic_id:
+                pairs_missing.append(st["title"])
+                continue
+            slug_fallback = f"topic-{st['id']}"
+            base_name = f"{dest_slug}--{_slug(st['title'], fallback=slug_fallback)}"
+            name = base_name
+            n = 2
+            while name in existing_names:
+                name = f"{base_name}-{n}"
+                n += 1
+            existing_names.add(name)
+            cfg.setdefault("pairs", []).append({
+                "name": name,
+                "source": source_id,
+                "dest": dest_chat_id,
+                "source_topic": st["id"],
+                "dest_topic": dest_topic_id,
+                "type": ftype,
+                "delay_seconds": delay_seconds,
+                "max_per_run": max_per_run,
+            })
+            pairs_added.append(name)
+
+        save_pairs(cfg)
+
+    return {
+        "dest_chat_id": dest_chat_id,
+        "dest_title": dest_title,
+        "topics_attempted": len(to_clone),
+        "topics_created": len(pairs_added),
+        "pairs_added": pairs_added,
+        "skipped_general": skipped,
+        "pairs_missing": pairs_missing,  # source topics whose dest twin we couldn't resolve
+    }
+
+
+@app.route("/api/clone-forum", methods=["POST"])
+async def api_clone_forum():
+    if not _dl:
+        return jsonify({"error": "telegram client not ready"}), 503
+    body = await request.get_json(force=True)
+    try:
+        source = int(body["source"])
+        dest_title = (body.get("dest_title") or "").strip()
+        if not dest_title:
+            return jsonify({"error": "dest_title required"}), 400
+        skip_general = bool(body.get("skip_general", True))
+        ftype = body.get("type", "all")
+        delay = float(body.get("delay_seconds", 1.0))
+        max_per_run = int(body.get("max_per_run", 200))
+    except (KeyError, ValueError, TypeError) as e:
+        return jsonify({"error": f"invalid params: {e}"}), 400
+
+    if ftype not in ("all", "media", "documents", "messages", "docs_and_text"):
+        return jsonify({"error": "type must be one of all|media|documents|messages|docs_and_text"}), 400
+
+    job = _new_job(kind="clone-forum", label=f"clone {source} -> {dest_title!r}")
+    job["status"] = "running"
+    _log_event({"kind": "clone_started", "source": source, "dest_title": dest_title, "job_id": job["id"]})
+    try:
+        result = await _clone_forum_impl(
+            source_id=source, dest_title=dest_title, skip_general=skip_general,
+            ftype=ftype, delay_seconds=delay, max_per_run=max_per_run, job=job,
+        )
+        if job["status"] != "cancelled":
+            job["status"] = "finished"
+        job["finished_at"] = int(time.time())
+        _log_event({"kind": "clone_finished", "source": source, "result": result, "job_id": job["id"]})
+        return jsonify({"ok": True, "result": result, "job_id": job["id"]})
+    except Exception as e:
+        job.update({"status": "error", "finished_at": int(time.time())})
+        _log_event({"kind": "clone_error", "source": source, "error": str(e), "job_id": job["id"]})
+        return jsonify({"error": str(e)}), 500
 
 
 # ───── Routes: run log ───────────────────────────────────────────────────
