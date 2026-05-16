@@ -117,7 +117,8 @@ class TelegramDownloader:
         if session_string:
             session = StringSession(session_string)
         else:
-            session = str(BASE_DIR / "tg_session")
+            session_name = os.environ.get("TELETHON_SESSION_FILE", "tg_session")
+            session = str(BASE_DIR / session_name)
         self.client = TelegramClient(session, self.api_id, self.api_hash)
         await self.client.start()
         me = await self.client.get_me()
