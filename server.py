@@ -321,6 +321,13 @@ async def _scheduler_loop():
 async def _startup():
     global _dl, _scheduler_task
     _load_run_log()
+    # Trigger one-time pairs.json seeding from PAIRS_JSON env var if applicable.
+    # Without this, a fresh volume + env var seed never lands on disk because
+    # downstream handlers short-circuit on _pairs_file_exists().
+    try:
+        load_pairs()
+    except FileNotFoundError:
+        print("no pairs configured yet — add some via the web UI")
     _dl = TelegramDownloader(load_config())
     await _dl.start()
     _scheduler_task = asyncio.create_task(_scheduler_loop())
