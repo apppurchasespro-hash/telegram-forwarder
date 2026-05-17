@@ -348,9 +348,11 @@ function escapeHtml(s) {
 }
 
 // ── Pairs ─────────────────────────────────────────────────────────────
+let PAIRS = [];
 async function loadPairs() {
   try {
     const data = await api('/api/pairs');
+    PAIRS = data.pairs || [];
     $('#interval-info').textContent = `interval: ${data.interval_seconds}s`;
     const rows = (data.pairs || []).map(p => {
       const srcLabel = p.source_topic ? `${p.source}/t${p.source_topic}` : p.source;
@@ -364,6 +366,7 @@ async function loadPairs() {
         <td class="text-xs text-slate-500">${p.updated_at ? new Date(p.updated_at*1000).toLocaleString() : '—'}</td>
         <td class="text-right">
           <button data-pair="${escapeHtml(p.name)}" data-act="run" class="text-xs text-blue-600 hover:underline">run</button>
+          <button data-pair="${escapeHtml(p.name)}" data-act="edit" class="text-xs text-amber-600 hover:underline ml-2">edit</button>
           <button data-pair="${escapeHtml(p.name)}" data-act="del" class="text-xs text-rose-600 hover:underline ml-2">delete</button>
         </td>
       </tr>
@@ -389,6 +392,28 @@ $('#pairs-tbody').addEventListener('click', async (e) => {
     } finally {
       btn.disabled = false; btn.textContent = 'run';
     }
+  } else if (btn.dataset.act === 'edit') {
+    const p = PAIRS.find(x => x.name === name);
+    if (!p) { toast('Pair not found', false); return; }
+    const f = document.getElementById('pair-form');
+    f.name.value = p.name;
+    f.source.value = p.source;
+    f.dest.value = p.dest;
+    f.type.value = p.type || 'all';
+    f.max_per_run.value = p.max_per_run ?? 200;
+    f.delay_seconds.value = p.delay_seconds ?? 1.0;
+    // Reload topic dropdowns for the chosen source/dest, then set the value
+    // once the options exist (loadTopicsFor preserves current value if valid,
+    // so we set the value first if cached, otherwise after the fetch).
+    const srcSel = document.querySelector('[data-topic-select="source"]');
+    const dstSel = document.querySelector('[data-topic-select="dest"]');
+    await loadTopicsFor(String(p.source), srcSel);
+    if (p.source_topic != null) srcSel.value = String(p.source_topic);
+    await loadTopicsFor(String(p.dest), dstSel);
+    if (p.dest_topic != null) dstSel.value = String(p.dest_topic);
+    f.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    f.name.focus();
+    toast(`Editing ${name}`);
   } else if (btn.dataset.act === 'del') {
     if (!confirm(`Delete pair "${name}"?\n(Watermark is kept — re-adding the pair won't re-forward history.)`)) return;
     await api(`/api/pairs/${encodeURIComponent(name)}`, { method: 'DELETE' });
