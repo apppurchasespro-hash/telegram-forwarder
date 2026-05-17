@@ -299,6 +299,105 @@ async def api_pair_run(name: str):
         return jsonify({"error": str(e)}), 500
 
 
+# ───── Routes: bulk run ──────────────────────────────────────────────────
+
+
+_bulk_runs: dict[str, dict] = {}  # bulk_id -> {names, status, current, started_at, cancel}
+
+
+async def _bulk_runner(bulk_id: str, names: list[str]) -> None:
+    state_holder = {}  # filled in from disk per-pair
+    bulk = _bulk_runs[bulk_id]
+    for idx, name in enumerate(names, 1):
+        if bulk.get("cancel"):
+            bulk["status"] = "cancelled"
+            break
+        bulk["current"] = name
+        bulk["index"] = idx
+        cfg = load_pairs() if _pairs_file_exists() else {"pairs": []}
+        pair = next((p for p in cfg.get("pairs", []) if p.get("name") == name), None)
+        if not pair:
+            _log_event({"kind": "bulk_skip", "pair": name, "reason": "not found", "bulk_id": bulk_id})
+            continue
+        async with _state_lock:
+            state_holder["state"] = load_state()
+        job = _new_job(kind="pair-bulk", label=f"pair:{name} (bulk {idx}/{len(names)})")
+        _log_event({"kind": "run_started", "pair": name, "trigger": "bulk", "job_id": job["id"], "bulk_id": bulk_id})
+        try:
+            result = await run_pair(_dl, pair, state_holder["state"], job=job)
+            async with _state_lock:
+                save_state(state_holder["state"])
+            if job["status"] == "running":
+                job["status"] = "finished"
+            job["finished_at"] = int(time.time())
+            _log_event({"kind": "run_finished", "pair": name, "result": result, "trigger": "bulk", "job_id": job["id"], "bulk_id": bulk_id})
+        except Exception as e:
+            job.update({"status": "error", "finished_at": int(time.time())})
+            _log_event({"kind": "run_error", "pair": name, "error": str(e), "trigger": "bulk", "job_id": job["id"], "bulk_id": bulk_id})
+        # Honor cancel between pairs without aborting mid-run.
+        if bulk.get("cancel"):
+            bulk["status"] = "cancelled"
+            break
+    if bulk["status"] == "running":
+        bulk["status"] = "finished"
+    bulk["finished_at"] = int(time.time())
+
+
+@app.route("/api/run-all", methods=["POST"])
+async def api_run_all():
+    """Fire-and-forget serial backfill. Body: {"names": [...]} or {"prefix": "..."}.
+
+    Returns immediately with the bulk_id and the queued names. Each pair runs
+    one-at-a-time in a background task and appears as a separate job in
+    /api/jobs so the existing job panel shows live progress. Cancel a single
+    pair via /api/jobs/<id>/cancel; cancel the whole bulk via
+    /api/run-all/<bulk_id>/cancel.
+    """
+    if not _dl:
+        return jsonify({"error": "telegram client not ready"}), 503
+    body = await request.get_json(silent=True) or {}
+    cfg = load_pairs() if _pairs_file_exists() else {"pairs": []}
+    all_names = [p.get("name") for p in cfg.get("pairs", []) if p.get("name")]
+    names: list[str]
+    if body.get("names"):
+        wanted = set(body["names"])
+        names = [n for n in all_names if n in wanted]
+    elif body.get("prefix"):
+        prefix = body["prefix"]
+        names = [n for n in all_names if n.startswith(prefix)]
+    else:
+        names = list(all_names)
+    if not names:
+        return jsonify({"error": "no pairs matched"}), 400
+
+    bulk_id = f"bulk-{int(time.time())}-{secrets.token_hex(3)}"
+    _bulk_runs[bulk_id] = {
+        "id": bulk_id, "names": names, "status": "running",
+        "index": 0, "total": len(names), "current": None,
+        "started_at": int(time.time()), "finished_at": None, "cancel": False,
+    }
+    asyncio.create_task(_bulk_runner(bulk_id, names))
+    _log_event({"kind": "bulk_started", "bulk_id": bulk_id, "count": len(names)})
+    return jsonify({"ok": True, "bulk_id": bulk_id, "queued": names})
+
+
+@app.route("/api/run-all/<bulk_id>/cancel", methods=["POST"])
+async def api_bulk_cancel(bulk_id: str):
+    bulk = _bulk_runs.get(bulk_id)
+    if not bulk:
+        return jsonify({"error": "bulk run not found"}), 404
+    bulk["cancel"] = True
+    _log_event({"kind": "bulk_cancel_requested", "bulk_id": bulk_id})
+    return jsonify({"ok": True, "bulk": {k: v for k, v in bulk.items() if k != "cancel"}})
+
+
+@app.route("/api/run-all")
+async def api_run_all_status():
+    """List recent bulk runs (live + finished)."""
+    runs = sorted(_bulk_runs.values(), key=lambda b: b["started_at"], reverse=True)[:20]
+    return jsonify({"bulks": [{k: v for k, v in b.items() if k != "cancel"} for b in runs]})
+
+
 # ───── Routes: one-shot forward ──────────────────────────────────────────
 
 

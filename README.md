@@ -19,6 +19,9 @@ Telegram's built-in forward fails on protected channels with `ChatForwardsRestri
 - FloodWait-aware: sleeps when Telegram tells it to
 - **Long-running automation** (`automate.py`): config-driven (source, dest, type) pairs polled on an interval, watermark per pair so only new messages get copied.
 - **Web UI** (`server.py`): browse chats, add/edit/delete recurring pairs, trigger one-shot forwards, view run history — all in one page behind HTTP Basic Auth. Includes Dockerfile + Railway config.
+- **Forum cloning end-to-end**: one click creates a new private supergroup, mirrors every source topic, and registers one recurring pair per topic.
+- **Bulk backfill**: kick off all (or a filtered subset of) pairs serially with `POST /api/run-all`. Each pair appears as a separate job in the live tracker.
+- **Live job tracker** with per-pair progress bars, cancel buttons that work mid-scan (not just between message copies), and inline edit on every pair row.
 
 ## Install
 
@@ -175,10 +178,29 @@ python server.py
 
 What you can do from the browser:
 - Browse all your chats with search/type filter; click to fill the source or dest field
-- Add, edit, delete recurring pairs
+- Add, edit, delete recurring pairs (inline "edit" on each row pre-fills the form, including the resolved source/dest topic dropdowns)
 - Trigger "Run now" on a single pair without waiting for the next interval
 - Send a one-shot forward (latest N messages of a given type) — doesn't touch watermarks
-- See the run log (manual + scheduled events, with errors)
+- **Clone a forum end-to-end**: provide a source forum chat ID and a destination title; the server creates a new private supergroup with forum=True, mirrors every topic, and writes one recurring pair per topic. Skips General by default (Telegram doesn't allow filtering by `reply_to=1`).
+- **Cancel a running job** at any time — works during the pre-fetch scan as well as between copies. Mid-file cancellation is not supported (Telethon doesn't expose download/upload cancellation).
+- See the run log (manual + scheduled events, with errors) and a live job tracker (3 s poll) with per-pair progress bars.
+
+### Bulk run
+
+`POST /api/run-all` queues every pair (or a filtered subset) to run **one at a time** in the background and returns immediately. Each pair shows up as its own job; the response carries a `bulk_id` you can cancel via `POST /api/run-all/<bulk_id>/cancel` (cancellation takes effect between pairs, not mid-run).
+
+```bash
+# all pairs
+curl -u $DASH_USER:$DASH_PASS -X POST $URL/api/run-all -d '{}'
+# only pairs whose name starts with a prefix
+curl -u $DASH_USER:$DASH_PASS -X POST $URL/api/run-all \
+  -H 'Content-Type: application/json' \
+  -d '{"prefix": "my-clone--"}'
+# specific names
+curl -u $DASH_USER:$DASH_PASS -X POST $URL/api/run-all \
+  -H 'Content-Type: application/json' \
+  -d '{"names": ["pair-a", "pair-b"]}'
+```
 
 Auth: HTTP Basic Auth using `DASH_USER` + `DASH_PASS` env vars. If `DASH_PASS` is unset, auth is **disabled** (only do that for local dev).
 
