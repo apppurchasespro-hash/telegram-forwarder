@@ -140,9 +140,20 @@ async def run_pair(dl: TelegramDownloader, pair: dict, state: dict, job: Optiona
     iter_kwargs = {"min_id": watermark}
     if source_topic and source_topic > 1:
         iter_kwargs["reply_to"] = source_topic
+    # When ftype="all" every message matches, so cap the fetch at max_per_run
+    # — for cloned pairs sitting at watermark=0 this stops us from walking the
+    # entire topic just to throw most of it away. For selective types we'd
+    # undershoot, so leave uncapped there.
+    if max_per_run and ftype == "all":
+        iter_kwargs["limit"] = max_per_run
 
     msgs = []
     async for m in dl.client.iter_messages(source, **iter_kwargs):
+        if job and job.get("cancel"):
+            print(f"[{name}] cancelled during scan ({len(msgs)} matched so far)")
+            job["status"] = "cancelled"
+            job["finished_at"] = int(time.time())
+            return {"forwarded": 0, "failed": 0, "last_id": watermark, "cancelled": True}
         if _matches_type(m, ftype, dl):
             msgs.append(m)
 

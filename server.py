@@ -331,6 +331,13 @@ async def api_forward_once():
 
     msgs = []
     async for m in _dl.client.iter_messages(source, **iter_kwargs):
+        if job.get("cancel"):
+            print(f"[oneshot {source}->{dest}] cancelled during scan ({len(msgs)} matched)")
+            job["status"] = "cancelled"
+            job["finished_at"] = int(time.time())
+            return jsonify({"ok": True, "result": {
+                "forwarded": 0, "failed": 0, "scanned": len(msgs), "cancelled": True,
+            }, "job_id": job["id"]})
         if _matches_type(m, ftype, _dl):
             msgs.append(m)
     msgs.sort(key=lambda m: m.id)
