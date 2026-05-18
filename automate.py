@@ -18,6 +18,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from telethon.errors import FloodWaitError
+
 from downloader import TelegramDownloader, load_config
 
 BASE_DIR = Path(__file__).parent
@@ -192,14 +194,35 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
     ftype = pair.get("type", "all")
     delay = float(pair.get("delay_seconds", 1.0))
     max_per_run = int(pair.get("max_per_run", 0)) or None
+    # Strip the "Forwarded from X" header on native forwards.
+    # Default True (most cloning use-cases want a clean mirror).
+    # Telegram requires the SENDING account to have Premium for this flag
+    # to work; non-premium accounts should set drop_author:false in their pair.
+    drop_author = bool(pair.get("drop_author", True))
 
     watermark = int(state.get(name, {}).get("last_msg_id", 0))
+
+    # Pick transport: native server-side forward (fast, no bandwidth) when
+    # allowed, otherwise copy-mode (download + re-upload). Native requires:
+    #   - source has forwarding enabled (noforwards=False)
+    #   - dest is not a forum topic (telethon 1.43 forward_messages has no
+    #     top_msg_id; forum-topic dests stay on copy-mode for now)
+    use_native = False
+    try:
+        src_entity = await dl.client.get_entity(source)
+        src_protected = bool(getattr(src_entity, "noforwards", False))
+        if not src_protected and not (dest_topic and dest_topic > 1):
+            use_native = True
+    except Exception as e:
+        print(f"[{name}] couldn't resolve source for noforwards check: {e} — using copy-mode")
+
+    mode = "native" if use_native else "copy"
     topic_note = ""
     if source_topic:
         topic_note += f" src_topic={source_topic}"
     if dest_topic:
         topic_note += f" dst_topic={dest_topic}"
-    print(f"[{name}] source={source} dest={dest} type={ftype}{topic_note} since=#{watermark}")
+    print(f"[{name}] source={source} dest={dest} type={ftype}{topic_note} since=#{watermark} mode={mode}")
 
     # Topic-aware iteration. reply_to=topic_id calls messages.getReplies and
     # returns only that topic's messages. Topic id=1 ("General") doesn't carry
@@ -215,6 +238,75 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
     if max_per_run and ftype == "all":
         iter_kwargs["limit"] = max_per_run
 
+    ok = fail = 0
+    last_ok_id = watermark
+
+    if use_native:
+        # Native server-side forward, STREAMING in batches of up to 100.
+        # Telegram allows up to 100 ids per messages.forwardMessages call.
+        # Streaming (instead of build-full-list-then-forward) keeps memory
+        # flat on huge channels — 80k messages * 5KB/msg-object would otherwise
+        # eat ~400MB before any forwarding starts and crash the worker.
+        # iter_messages(reverse=True, min_id=X) yields msg.id > X in ASCENDING
+        # order, so we forward chronologically and each successful batch
+        # advances the watermark.
+        BATCH = 100
+        iter_kwargs.pop("limit", None)  # streaming: paginate via Telethon, cap by max_per_run below
+        batch = []
+        i = 0
+        progress_printed_at = 0
+        async def _flush_batch():
+            nonlocal ok, fail, last_ok_id, i, batch, progress_printed_at
+            if not batch:
+                return False
+            try:
+                forwarded = await dl.client.forward_messages(dest, batch, source, drop_author=drop_author)
+            except FloodWaitError as fw:
+                print(f"[{name}] flood wait {fw.seconds}s")
+                await asyncio.sleep(fw.seconds)
+                forwarded = await dl.client.forward_messages(dest, batch, source, drop_author=drop_author)
+            for m, f in zip(batch, forwarded):
+                if f is not None:
+                    ok += 1
+                    last_ok_id = m.id
+                else:
+                    fail += 1
+            i += len(batch)
+            now = int(time.time())
+            state[name] = {"last_msg_id": last_ok_id, "updated_at": now}
+            await save_pair_watermark(name, last_ok_id, now)
+            if job:
+                job.update({"done": i, "ok": ok, "fail": fail, "last_id": last_ok_id, "status": "running"})
+            # Print every batch (more visible than every 10) — native is fast enough.
+            print(f"[{name}] progress {i} (ok={ok} fail={fail} last_id=#{last_ok_id})")
+            progress_printed_at = i
+            batch.clear()
+            return True
+
+        async for m in dl.client.iter_messages(source, reverse=True, **iter_kwargs):
+            if job and job.get("cancel"):
+                print(f"[{name}] cancelled during scan at i={i}")
+                job["status"] = "cancelled"
+                break
+            if not _matches_type(m, ftype, dl):
+                continue
+            batch.append(m)
+            if len(batch) >= BATCH:
+                await _flush_batch()
+                if max_per_run and i >= max_per_run:
+                    break
+                await asyncio.sleep(delay)
+        # Final partial batch.
+        if batch and not (job and job.get("cancel")):
+            await _flush_batch()
+        if job and job["status"] == "running":
+            job["status"] = "finished"
+        print(f"[{name}] done: forwarded={ok} failed={fail} new_watermark=#{last_ok_id}")
+        return {"forwarded": ok, "failed": fail, "last_id": last_ok_id}
+
+    # ── Copy-mode (protected source or forum-topic dest) — per-message D+U.
+    # Still builds the full list first; copy mode is slow per-message anyway so
+    # the scan overhead is negligible relative to one big file's upload time.
     msgs = []
     async for m in dl.client.iter_messages(source, **iter_kwargs):
         if job and job.get("cancel"):
@@ -240,9 +332,6 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
 
     if job:
         job.update({"total": len(msgs), "status": "running"})
-
-    ok = fail = 0
-    last_ok_id = watermark
     for i, m in enumerate(msgs, 1):
         if job and job.get("cancel"):
             print(f"[{name}] cancelled at {i}/{len(msgs)}")

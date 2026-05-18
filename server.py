@@ -242,6 +242,10 @@ async def api_pairs_post():
             "delay_seconds": float(body.get("delay_seconds", 1.0)),
             "max_per_run": int(body.get("max_per_run", 200)),
         }
+        # Only persist drop_author when caller actually sent it — otherwise
+        # leave it absent so run_pair's default (True) applies.
+        if "drop_author" in body:
+            new_pair["drop_author"] = bool(body["drop_author"])
         # Drop nulls so JSON stays clean for users who don't use topics.
         new_pair = {k: v for k, v in new_pair.items() if v is not None}
     except (KeyError, ValueError, TypeError) as e:
