@@ -12,6 +12,7 @@ __pycache__/
 downloads/
 temp/
 data/
+data_acct*/
 .venv/
 venv/
 .env
