@@ -22,6 +22,7 @@ Telegram's built-in forward fails on protected channels with `ChatForwardsRestri
 - **Forum cloning end-to-end**: one click creates a new private supergroup, mirrors every source topic, and registers one recurring pair per topic.
 - **Bulk backfill**: kick off all (or a filtered subset of) pairs serially with `POST /api/run-all`. Each pair appears as a separate job in the live tracker.
 - **Live job tracker** with per-pair progress bars, cancel buttons that work mid-scan (not just between message copies), and inline edit on every pair row.
+- **Pause / Resume** kill switch (`POST /api/pause` / `POST /api/resume`): cancels every in-flight job, halts the scheduler between cycles, and blocks bulk/manual/one-shot triggers until resumed. One-click in the header.
 
 ## Install
 
@@ -203,6 +204,18 @@ curl -u $DASH_USER:$DASH_PASS -X POST $URL/api/run-all \
 ```
 
 Auth: HTTP Basic Auth using `DASH_USER` + `DASH_PASS` env vars. If `DASH_PASS` is unset, auth is **disabled** (only do that for local dev).
+
+### Watermark repair
+
+`POST /api/pairs/<name>/watermark` overrides a pair's stored watermark. Use this to skip ahead (so historical messages aren't re-forwarded after a clone) or to roll backwards to re-forward a range. Always allowed to move the value in either direction.
+
+```bash
+curl -u $DASH_USER:$DASH_PASS -X POST $URL/api/pairs/my-pair/watermark \
+  -H 'Content-Type: application/json' \
+  -d '{"last_msg_id": 12345}'
+```
+
+Internally, per-message watermark saves go through `automate.py::save_pair_watermark`, an atomic read-modify-write of one pair's key under a process-wide lock. This prevents concurrent runners (scheduler + bulk + manual on different pairs) from clobbering each other when each holds a stale full-state snapshot. The save also refuses to write a value LOWER than what's on disk unless `allow_regression=True` (only the repair endpoint sets that flag), so a stale in-flight job cannot zap a manual repair.
 
 ### Deploy on Railway (24/7)
 
