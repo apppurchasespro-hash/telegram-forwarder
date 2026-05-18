@@ -15,4 +15,5 @@ data/
 .venv/
 venv/
 .env
+railway_backup_*/
 .DS_Store
