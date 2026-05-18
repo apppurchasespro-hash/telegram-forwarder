@@ -142,6 +142,12 @@ def _pair_key(pair: dict) -> str:
 
 
 def _matches_type(msg, ftype: str, dl: TelegramDownloader) -> bool:
+    # Telegram service messages ("user joined", "channel created", "pinned X",
+    # etc.) cannot be forwarded — forward_messages errors out and copy-mode has
+    # nothing to send. Skip them regardless of ftype.
+    from telethon.tl.patched import MessageService
+    if isinstance(msg, MessageService):
+        return False
     if ftype == "all":
         return True
     if ftype == "media":
@@ -264,7 +270,28 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
             except FloodWaitError as fw:
                 print(f"[{name}] flood wait {fw.seconds}s")
                 await asyncio.sleep(fw.seconds)
-                forwarded = await dl.client.forward_messages(dest, batch, source, drop_author=drop_author)
+                try:
+                    forwarded = await dl.client.forward_messages(dest, batch, source, drop_author=drop_author)
+                except Exception as e:
+                    print(f"[{name}] batch failed after flood-wait retry: {e} — skipping {len(batch)} msgs (last id #{batch[-1].id})")
+                    fail += len(batch)
+                    i += len(batch)
+                    batch.clear()
+                    return False
+            except Exception as e:
+                # One bad message (e.g. expired/unsupported media) would 500
+                # the whole batch. Mark batch as failed and advance so the
+                # run doesn't get stuck retrying the same broken span forever.
+                print(f"[{name}] batch failed: {e} — skipping {len(batch)} msgs (last id #{batch[-1].id})")
+                fail += len(batch)
+                # Advance watermark past the bad batch so we don't loop on it.
+                last_ok_id = max(last_ok_id, batch[-1].id)
+                now = int(time.time())
+                state[name] = {"last_msg_id": last_ok_id, "updated_at": now}
+                await save_pair_watermark(name, last_ok_id, now)
+                i += len(batch)
+                batch.clear()
+                return False
             for m, f in zip(batch, forwarded):
                 if f is not None:
                     ok += 1
