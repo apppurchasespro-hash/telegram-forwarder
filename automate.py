@@ -95,6 +95,46 @@ def save_state(state: dict) -> None:
     tmp.replace(path)
 
 
+# Serializes the per-pair atomic save. Without this, two concurrent runners
+# each hold a stale snapshot of the full state dict and clobber each other's
+# keys when they call save_state(state). Observed 2026-05-19: scheduled jobs
+# successfully forwarded N messages and saved wm=X, but concurrent bulk runs
+# on different pairs wrote stale dicts that reset that pair's wm back to its
+# pre-run value (or 0). Next bulk iteration on the reset pair re-forwarded
+# everything → duplicates in destination.
+_save_lock = asyncio.Lock()
+
+
+async def save_pair_watermark(name: str, last_msg_id: int, updated_at: int, *, allow_regression: bool = False) -> None:
+    """Atomic read-modify-write of one pair's watermark. Reload latest from
+    disk, update only this pair's key, write back. Preserves any updates other
+    runners made to other keys between our last load and now.
+
+    By default refuses to write a value LOWER than what's already on disk.
+    This protects against a stale in-flight run (loaded state when wm was X,
+    started copying at X+1) zapping a manual repair (`/api/pairs/.../watermark`
+    set wm=Y where Y > X). Pass `allow_regression=True` to override (used by
+    the repair endpoint itself when you want to roll a watermark backwards).
+    """
+    async with _save_lock:
+        path = _resolve_state_path()
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+        else:
+            state = {}
+        if not allow_regression:
+            current = int(state.get(name, {}).get("last_msg_id", 0))
+            if last_msg_id < current:
+                return
+        state[name] = {"last_msg_id": last_msg_id, "updated_at": updated_at}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, sort_keys=True)
+        tmp.replace(path)
+
+
 def _pair_key(pair: dict) -> str:
     return pair.get("name") or f"{pair['source']}:{pair['dest']}"
 
@@ -213,8 +253,10 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
             ok += 1
             last_ok_id = m.id
             # Persist watermark per-message so a crash doesn't re-send anything.
-            state[name] = {"last_msg_id": last_ok_id, "updated_at": int(time.time())}
-            save_state(state)
+            # Atomic per-pair RMW — see save_pair_watermark docstring.
+            now = int(time.time())
+            state[name] = {"last_msg_id": last_ok_id, "updated_at": now}
+            await save_pair_watermark(name, last_ok_id, now)
         else:
             fail += 1
         if job:
