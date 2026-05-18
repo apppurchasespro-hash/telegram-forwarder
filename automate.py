@@ -115,7 +115,35 @@ def _matches_type(msg, ftype: str, dl: TelegramDownloader) -> bool:
     return False
 
 
+# Per-pair locks so the bulk runner, scheduler, and manual UI clicks can't
+# concurrently iterate the same source — concurrent runs double-post because
+# each runner loads the same watermark and walks the same message range.
+_pair_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_pair_lock(name: str) -> asyncio.Lock:
+    lock = _pair_locks.get(name)
+    if lock is None:
+        lock = asyncio.Lock()
+        _pair_locks[name] = lock
+    return lock
+
+
 async def run_pair(dl: TelegramDownloader, pair: dict, state: dict, job: Optional[dict] = None) -> dict:
+    name = _pair_key(pair)
+    lock = _get_pair_lock(name)
+    if lock.locked():
+        # Another runner has this pair. Bail out instead of double-posting.
+        print(f"[{name}] another runner holds the lock — skipping this attempt")
+        if job:
+            job.update({"status": "finished", "total": 0})
+        return {"forwarded": 0, "failed": 0, "last_id": int(state.get(name, {}).get("last_msg_id", 0)),
+                "skipped_locked": True}
+    async with lock:
+        return await _run_pair_locked(dl, pair, state, job)
+
+
+async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job: Optional[dict] = None) -> dict:
     name = _pair_key(pair)
     source = pair["source"]
     dest = pair["dest"]
