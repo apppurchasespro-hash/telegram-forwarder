@@ -34,6 +34,7 @@ from automate import (
     save_pairs,
     load_state,
     save_state,
+    save_pair_watermark,
     run_pair,
     _pair_key,
     _matches_type,
@@ -58,6 +59,11 @@ RUN_LOG_PATH = Path(os.environ.get("RUN_LOG_PATH", str(BASE_DIR / "run_log.json"
 _jobs: dict[str, dict] = {}
 _JOBS_MAX = 200
 _job_counter = 0
+
+# Global pause flag. When True: scheduler skips new pair runs, bulks halt
+# between pairs, all in-flight jobs receive cancel. Survives nothing on
+# restart — re-pause after deploy if you still want the brake on.
+_paused: bool = False
 
 
 def _new_job(kind: str, label: str, total: int = 0) -> dict:
@@ -273,10 +279,25 @@ async def api_pair_delete(name: str):
     return jsonify({"ok": True, "removed": removed})
 
 
+@app.route("/api/pairs/<name>/watermark", methods=["POST"])
+async def api_set_watermark(name: str):
+    """Manually set a pair's watermark. Body: {"last_msg_id": int}.
+    Used to repair clobbered watermarks (see 2026-05-19 race) or to skip ahead.
+    """
+    body = await request.get_json(force=True)
+    wm = int(body.get("last_msg_id", 0))
+    # Manual repair allowed to roll backwards (e.g., to re-forward a range).
+    await save_pair_watermark(name, wm, int(time.time()), allow_regression=True)
+    _log_event({"kind": "watermark_set", "pair": name, "wm": wm})
+    return jsonify({"ok": True, "pair": name, "watermark": wm})
+
+
 @app.route("/api/pairs/<name>/run", methods=["POST"])
 async def api_pair_run(name: str):
     if not _dl:
         return jsonify({"error": "telegram client not ready"}), 503
+    if _paused:
+        return jsonify({"error": "paused — POST /api/resume first"}), 409
     cfg = load_pairs() if _pairs_file_exists() else {"pairs": []}
     pair = next((p for p in cfg.get("pairs", []) if p.get("name") == name), None)
     if not pair:
@@ -288,8 +309,7 @@ async def api_pair_run(name: str):
     _log_event({"kind": "run_started", "pair": name, "trigger": "manual", "job_id": job["id"]})
     try:
         result = await run_pair(_dl, pair, state, job=job)
-        async with _state_lock:
-            save_state(state)
+        # No save_state here — run_pair persists per-pair via save_pair_watermark.
         job["finished_at"] = int(time.time())
         _log_event({"kind": "run_finished", "pair": name, "result": result, "trigger": "manual", "job_id": job["id"]})
         return jsonify({"ok": True, "result": result, "job_id": job["id"]})
@@ -309,7 +329,7 @@ async def _bulk_runner(bulk_id: str, names: list[str]) -> None:
     state_holder = {}  # filled in from disk per-pair
     bulk = _bulk_runs[bulk_id]
     for idx, name in enumerate(names, 1):
-        if bulk.get("cancel"):
+        if bulk.get("cancel") or _paused:
             bulk["status"] = "cancelled"
             break
         bulk["current"] = name
@@ -325,8 +345,9 @@ async def _bulk_runner(bulk_id: str, names: list[str]) -> None:
         _log_event({"kind": "run_started", "pair": name, "trigger": "bulk", "job_id": job["id"], "bulk_id": bulk_id})
         try:
             result = await run_pair(_dl, pair, state_holder["state"], job=job)
-            async with _state_lock:
-                save_state(state_holder["state"])
+            # Per-pair watermark already persisted atomically inside run_pair
+            # via save_pair_watermark. Don't save_state(full_dict) here — it
+            # would write our stale snapshot over keys other runners updated.
             if job["status"] == "running":
                 job["status"] = "finished"
             job["finished_at"] = int(time.time())
@@ -355,6 +376,8 @@ async def api_run_all():
     """
     if not _dl:
         return jsonify({"error": "telegram client not ready"}), 503
+    if _paused:
+        return jsonify({"error": "paused — POST /api/resume first"}), 409
     body = await request.get_json(silent=True) or {}
     cfg = load_pairs() if _pairs_file_exists() else {"pairs": []}
     all_names = [p.get("name") for p in cfg.get("pairs", []) if p.get("name")]
@@ -398,6 +421,44 @@ async def api_run_all_status():
     return jsonify({"bulks": [{k: v for k, v in b.items() if k != "cancel"} for b in runs]})
 
 
+# ───── Routes: pause / resume ───────────────────────────────────────────
+
+
+@app.route("/api/pause", methods=["GET"])
+async def api_pause_status():
+    return jsonify({"paused": _paused})
+
+
+@app.route("/api/pause", methods=["POST"])
+async def api_pause():
+    """Halt everything: cancel in-flight jobs + bulks, block scheduler from
+    starting new pair runs. Until /api/resume is hit.
+    """
+    global _paused
+    _paused = True
+    cancelled_jobs = []
+    for jid, job in _jobs.items():
+        if job.get("status") in ("running", "queued"):
+            job["cancel"] = True
+            cancelled_jobs.append(jid)
+    cancelled_bulks = []
+    for bid, bulk in _bulk_runs.items():
+        if bulk.get("status") == "running":
+            bulk["cancel"] = True
+            cancelled_bulks.append(bid)
+    _log_event({"kind": "paused", "cancelled_jobs": cancelled_jobs, "cancelled_bulks": cancelled_bulks})
+    return jsonify({"ok": True, "paused": True, "cancelled_jobs": cancelled_jobs, "cancelled_bulks": cancelled_bulks})
+
+
+@app.route("/api/resume", methods=["POST"])
+async def api_resume():
+    global _paused
+    was = _paused
+    _paused = False
+    _log_event({"kind": "resumed", "was_paused": was})
+    return jsonify({"ok": True, "paused": False})
+
+
 # ───── Routes: one-shot forward ──────────────────────────────────────────
 
 
@@ -405,6 +466,8 @@ async def api_run_all_status():
 async def api_forward_once():
     if not _dl:
         return jsonify({"error": "telegram client not ready"}), 503
+    if _paused:
+        return jsonify({"error": "paused — POST /api/resume first"}), 409
     body = await request.get_json(force=True)
     def _opt_int(v):
         if v in (None, "", "null"):
@@ -664,6 +727,8 @@ async def _scheduler_loop():
             cfg = load_pairs() if _pairs_file_exists() else {"interval_seconds": 3600, "pairs": []}
             interval = max(60, int(cfg.get("interval_seconds", 3600)))
             for pair in cfg.get("pairs", []):
+                if _paused:
+                    break
                 name = _pair_key(pair)
                 job = _new_job(kind="pair-scheduled", label=f"pair:{name} (scheduled)")
                 try:
@@ -671,8 +736,7 @@ async def _scheduler_loop():
                         state = load_state()
                     _log_event({"kind": "run_started", "pair": name, "trigger": "scheduler", "job_id": job["id"]})
                     result = await run_pair(_dl, pair, state, job=job)
-                    async with _state_lock:
-                        save_state(state)
+                    # No save_state here — see _bulk_runner comment.
                     job["finished_at"] = int(time.time())
                     _log_event({"kind": "run_finished", "pair": name, "result": result, "trigger": "scheduler", "job_id": job["id"]})
                 except Exception as e:

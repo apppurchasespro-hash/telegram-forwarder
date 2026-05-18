@@ -28,10 +28,16 @@
         <h1 class="text-lg font-semibold">Telegram Forwarder</h1>
         <p class="text-xs text-slate-500">Manage forwards, list chats, run on demand</p>
       </div>
-      <div class="text-xs text-slate-500">
-        <span id="status-dot" class="inline-block w-2 h-2 rounded-full bg-slate-300 mr-1"></span>
-        <span id="status-text">connecting…</span>
+      <div class="flex items-center gap-3 text-xs text-slate-500">
+        <button id="pause-btn" class="px-3 py-1 rounded font-semibold text-white bg-amber-600 hover:bg-amber-700">Pause all</button>
+        <div>
+          <span id="status-dot" class="inline-block w-2 h-2 rounded-full bg-slate-300 mr-1"></span>
+          <span id="status-text">connecting…</span>
+        </div>
       </div>
+    </div>
+    <div id="pause-banner" class="hidden bg-amber-100 border-t border-amber-300 text-amber-900 text-sm px-4 py-2 text-center font-medium">
+      Forwarder is <b>paused</b> — scheduler, bulk runs, and manual triggers are blocked. Click <b>Resume</b> to re-enable.
     </div>
   </header>
 
@@ -604,8 +610,44 @@ async function loadRuns() {
 }
 $('#reload-runs').onclick = loadRuns;
 
+// ── Pause / Resume ────────────────────────────────────────────────────
+let PAUSED = false;
+function renderPauseState() {
+  const btn = $('#pause-btn'), banner = $('#pause-banner');
+  if (PAUSED) {
+    btn.textContent = 'Resume';
+    btn.classList.remove('bg-amber-600', 'hover:bg-amber-700');
+    btn.classList.add('bg-emerald-600', 'hover:bg-emerald-700');
+    banner.classList.remove('hidden');
+  } else {
+    btn.textContent = 'Pause all';
+    btn.classList.add('bg-amber-600', 'hover:bg-amber-700');
+    btn.classList.remove('bg-emerald-600', 'hover:bg-emerald-700');
+    banner.classList.add('hidden');
+  }
+}
+async function loadPauseState() {
+  try {
+    const r = await fetch('/api/pause');
+    const d = await r.json();
+    PAUSED = !!d.paused;
+    renderPauseState();
+  } catch (e) {}
+}
+$('#pause-btn').onclick = async () => {
+  if (!PAUSED && !confirm('Pause all: cancel every running job + block scheduler / bulks / manual runs?')) return;
+  const ep = PAUSED ? '/api/resume' : '/api/pause';
+  const r = await fetch(ep, { method: 'POST' });
+  const d = await r.json();
+  if (!r.ok) { alert(d.error || 'failed'); return; }
+  PAUSED = !!d.paused;
+  renderPauseState();
+  await Promise.all([loadJobs(), loadRuns()]);
+};
+
 // ── Init ──────────────────────────────────────────────────────────────
 (async () => {
+  await loadPauseState();
   await loadChats();
   await loadPairs();
   await loadJobs();
@@ -613,6 +655,7 @@ $('#reload-runs').onclick = loadRuns;
   setInterval(loadJobs, 3000);   // tight — so progress bars feel live
   setInterval(loadRuns, 15000);
   setInterval(loadPairs, 30000);
+  setInterval(loadPauseState, 10000);
 })();
 </script>
 </body>
