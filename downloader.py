@@ -309,9 +309,14 @@ class TelegramDownloader:
 
     # ─── Copy (download + re-upload, bypasses restrictions) ──────
 
-    async def _copy_message_to(self, msg, dest_id: int | str, dest_topic: Optional[int] = None) -> bool:
+    async def _copy_message_to(self, msg, dest_id: int | str, dest_topic: Optional[int] = None,
+                               text_override: Optional[str] = None):
         # dest_topic: forum supergroup topic id. None or 1 = General/no topic.
+        # text_override: replaces msg.message verbatim (drops entities since
+        # offsets would be wrong). Used by automate's per-pair replacements.
+        # Returns the sent Message on success, None on failure.
         reply_to = dest_topic if (dest_topic and dest_topic > 1) else None
+        use_override = text_override is not None
         try:
             if msg.media and not isinstance(msg.media, MessageMediaWebPage):
                 temp_dir = BASE_DIR / "temp"
@@ -332,39 +337,39 @@ class TelegramDownloader:
                 safe_temp = temp_dir / f"tmp_{msg.id}{ext}"
                 temp_path = await self.client.download_media(msg, file=str(safe_temp))
                 if not temp_path:
-                    return False
-                caption = msg.message or ""
-                # Restore original filename on the sent file via attributes
+                    return None
+                caption = text_override if use_override else (msg.message or "")
                 send_kwargs = {"caption": caption}
-                if msg.entities:
+                if msg.entities and not use_override:
                     send_kwargs["formatting_entities"] = msg.entities
                 if original_name:
                     send_kwargs["force_document"] = True
                     send_kwargs["attributes"] = [DocumentAttributeFilename(original_name)]
                 if reply_to:
                     send_kwargs["reply_to"] = reply_to
-                await self.client.send_file(dest_id, temp_path, **send_kwargs)
+                sent = await self.client.send_file(dest_id, temp_path, **send_kwargs)
                 try:
                     os.remove(temp_path)
                 except OSError:
                     pass
-            elif msg.message:
-                await self.client.send_message(
+                return sent
+            text = text_override if use_override else msg.message
+            if text:
+                sent = await self.client.send_message(
                     dest_id,
-                    msg.message,
-                    formatting_entities=msg.entities or None,
+                    text,
+                    formatting_entities=(msg.entities or None) if not use_override else None,
                     reply_to=reply_to,
                 )
-            else:
-                return False
-            return True
+                return sent
+            return None
         except FloodWaitError as fw:
             print(f"\n  ⏳ Flood wait {fw.seconds}s...")
             await asyncio.sleep(fw.seconds)
-            return await self._copy_message_to(msg, dest_id, dest_topic=dest_topic)
+            return await self._copy_message_to(msg, dest_id, dest_topic=dest_topic, text_override=text_override)
         except Exception as e:
             print(f"\n  ✗ Failed msg #{msg.id}: {e}")
-            return False
+            return None
 
     # ─── Forward topic ────────────────────────────────────────────
 

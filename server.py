@@ -23,7 +23,8 @@ from typing import Optional
 
 from quart import Quart, request, jsonify, render_template, Response
 
-from telethon import utils as tg_utils
+from telethon import events, utils as tg_utils
+from telethon.errors import MessageNotModifiedError
 from telethon.tl.functions.channels import CreateChannelRequest, ToggleForumRequest
 from telethon.tl.functions.messages import CreateForumTopicRequest
 
@@ -38,6 +39,10 @@ from automate import (
     run_pair,
     _pair_key,
     _matches_type,
+    apply_replacements,
+    load_message_map,
+    lookup_dest_id,
+    forget_mappings,
 )
 
 # ───── State ──────────────────────────────────────────────────────────────
@@ -246,6 +251,24 @@ async def api_pairs_post():
         # leave it absent so run_pair's default (True) applies.
         if "drop_author" in body:
             new_pair["drop_author"] = bool(body["drop_author"])
+        # Optional per-pair text replacements. Schema is a list of
+        # {find, replace, regex?} dicts. Presence of a non-empty list forces
+        # copy-mode for this pair (native forward can't transform content).
+        if "replacements" in body:
+            raw = body.get("replacements") or []
+            if not isinstance(raw, list):
+                return jsonify({"error": "replacements must be a list"}), 400
+            cleaned = []
+            for r in raw:
+                if not isinstance(r, dict) or not r.get("find"):
+                    continue
+                cleaned.append({
+                    "find": str(r.get("find", "")),
+                    "replace": str(r.get("replace", "")),
+                    "regex": bool(r.get("regex", False)),
+                })
+            if cleaned:
+                new_pair["replacements"] = cleaned
         # Drop nulls so JSON stays clean for users who don't use topics.
         new_pair = {k: v for k, v in new_pair.items() if v is not None}
     except (KeyError, ValueError, TypeError) as e:
@@ -755,6 +778,105 @@ async def _scheduler_loop():
             await asyncio.sleep(60)
 
 
+# ───── Live edit/delete propagation ───────────────────────────────────────
+# When a source message is edited or deleted, mirror the change to every
+# pair's destination. Inspired by khoben/telemirror's edit/delete propagation.
+# We register one global handler (no chats= filter) and dispatch by looking
+# up event.chat_id against current pair sources — that way runtime pair adds
+# and deletes are picked up without re-registering. Handler failures are
+# logged and swallowed so a single broken pair can't kill the dispatcher.
+
+
+def _pairs_for_source(source_chat_id: int) -> list[dict]:
+    """Return all configured pairs whose source matches this chat id.
+    Reads pairs.json each call so newly-added pairs pick up edits without
+    a restart. Cheap (file is small)."""
+    try:
+        cfg = load_pairs() if _pairs_file_exists() else {"pairs": []}
+    except Exception:
+        return []
+    return [p for p in cfg.get("pairs", []) if int(p.get("source", 0)) == int(source_chat_id)]
+
+
+async def _on_source_edited(event) -> None:
+    if not _dl or not _dl.client:
+        return
+    chat_id = getattr(event, "chat_id", None)
+    if chat_id is None:
+        return
+    pairs = _pairs_for_source(chat_id)
+    if not pairs:
+        return
+    msg = event.message
+    src_msg_id = getattr(msg, "id", None)
+    if src_msg_id is None:
+        return
+    for pair in pairs:
+        name = _pair_key(pair)
+        dest_msg_id = lookup_dest_id(name, src_msg_id)
+        if dest_msg_id is None:
+            # Message was forwarded before this feature shipped (or before
+            # we joined). Nothing to update on the dest side.
+            continue
+        try:
+            new_text = apply_replacements(msg.message or "", pair.get("replacements") or [])
+            text_was_transformed = bool(pair.get("replacements")) and new_text != (msg.message or "")
+            await _dl.client.edit_message(
+                int(pair["dest"]),
+                dest_msg_id,
+                new_text,
+                formatting_entities=None if text_was_transformed else msg.entities,
+            )
+            _log_event({"kind": "live_edit", "pair": name, "src_id": src_msg_id, "dest_id": dest_msg_id})
+        except MessageNotModifiedError:
+            pass  # source emitted an edit event but content is unchanged (reactions, views, etc.)
+        except Exception as e:
+            print(f"[live-edit {name}] {src_msg_id} -> {dest_msg_id} failed: {e}", file=sys.stderr)
+            _log_event({"kind": "live_edit_error", "pair": name, "src_id": src_msg_id, "error": str(e)})
+
+
+async def _on_source_deleted(event) -> None:
+    if not _dl or not _dl.client:
+        return
+    chat_id = getattr(event, "chat_id", None)
+    # Channel deletes always include chat_id; private/group deletes may not,
+    # and we don't mirror those anyway — skip if missing.
+    if chat_id is None:
+        return
+    pairs = _pairs_for_source(chat_id)
+    if not pairs:
+        return
+    deleted_ids = list(getattr(event, "deleted_ids", []) or [])
+    if not deleted_ids:
+        return
+    for pair in pairs:
+        name = _pair_key(pair)
+        dest = int(pair["dest"])
+        to_delete = []
+        mapped_srcs = []
+        for sid in deleted_ids:
+            did = lookup_dest_id(name, sid)
+            if did is not None:
+                to_delete.append(did)
+                mapped_srcs.append(sid)
+        if not to_delete:
+            continue
+        try:
+            await _dl.client.delete_messages(dest, to_delete)
+            await forget_mappings(name, mapped_srcs)
+            _log_event({"kind": "live_delete", "pair": name, "count": len(to_delete)})
+        except Exception as e:
+            print(f"[live-delete {name}] {to_delete} failed: {e}", file=sys.stderr)
+            _log_event({"kind": "live_delete_error", "pair": name, "error": str(e)})
+
+
+def _register_event_handlers() -> None:
+    if not _dl or not _dl.client:
+        return
+    _dl.client.add_event_handler(_on_source_edited, events.MessageEdited())
+    _dl.client.add_event_handler(_on_source_deleted, events.MessageDeleted())
+
+
 # ───── Lifecycle ──────────────────────────────────────────────────────────
 
 
@@ -769,8 +891,10 @@ async def _startup():
         load_pairs()
     except FileNotFoundError:
         print("no pairs configured yet — add some via the web UI")
+    load_message_map()
     _dl = TelegramDownloader(load_config())
     await _dl.start()
+    _register_event_handlers()
     _scheduler_task = asyncio.create_task(_scheduler_loop())
     print(f"server ready — dash_user={DASH_USER!r} auth={'on' if DASH_PASS else 'OFF (set DASH_PASS)'}")
 

@@ -13,6 +13,7 @@ Run modes:
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -25,6 +26,7 @@ from downloader import TelegramDownloader, load_config
 BASE_DIR = Path(__file__).parent
 DEFAULT_PAIRS = BASE_DIR / "pairs.json"
 DEFAULT_STATE = BASE_DIR / "watermarks.json"
+DEFAULT_MSG_MAP = BASE_DIR / "message_map.json"
 
 
 def _resolve_pairs_path() -> Path:
@@ -34,6 +36,116 @@ def _resolve_pairs_path() -> Path:
 
 def _resolve_state_path() -> Path:
     return Path(os.environ.get("STATE_PATH", str(DEFAULT_STATE)))
+
+
+def _resolve_msg_map_path() -> Path:
+    return Path(os.environ.get("MSG_MAP_PATH", str(DEFAULT_MSG_MAP)))
+
+
+# Per-pair regex find/replace rules applied to message text + caption in
+# copy-mode. Inspired by aahnik/tgcf's "format" plugin. Returns a new string —
+# never mutates input. Bad regex patterns are skipped silently.
+def apply_replacements(text: Optional[str], rules: Optional[list]) -> str:
+    if not text:
+        return text or ""
+    if not rules:
+        return text
+    out = text
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        find = rule.get("find", "")
+        replace = rule.get("replace", "")
+        if not find:
+            continue
+        if rule.get("regex", False):
+            try:
+                out = re.sub(find, replace, out)
+            except re.error:
+                continue
+        else:
+            out = out.replace(find, replace)
+    return out
+
+
+# ── Source-message-id → destination-message-id map ────────────────────────
+# Powers live edit/delete propagation (telemirror-style). When the source
+# edits or deletes a message we forwarded, the event handler in server.py
+# looks up the dest id here and applies the same change. Structure:
+#   {pair_name: {str(src_id): dest_id}}
+# JSON requires string keys; we cast on read.
+_msg_map: dict[str, dict[str, int]] = {}
+_msg_map_lock = asyncio.Lock()
+_msg_map_loaded = False
+
+
+def load_message_map() -> dict:
+    """Read from disk into in-memory _msg_map. Idempotent."""
+    global _msg_map, _msg_map_loaded
+    path = _resolve_msg_map_path()
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                _msg_map = data
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"message_map.json unreadable, starting fresh: {e}", file=sys.stderr)
+            _msg_map = {}
+    _msg_map_loaded = True
+    return _msg_map
+
+
+async def _flush_message_map_locked() -> None:
+    """Caller must hold _msg_map_lock. Atomic write via .tmp+replace."""
+    path = _resolve_msg_map_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(_msg_map, f)
+    tmp.replace(path)
+
+
+async def record_mappings(pair_name: str, pairs_iter) -> None:
+    """Record many (src_id, dest_id) pairs atomically + flush.
+
+    pairs_iter: iterable of (src_id, dest_id) tuples.
+    Skips Nones (failed sends). Safe to call concurrently from multiple runners.
+    """
+    async with _msg_map_lock:
+        bucket = _msg_map.setdefault(pair_name, {})
+        any_added = False
+        for src_id, dest_id in pairs_iter:
+            if src_id is None or dest_id is None:
+                continue
+            bucket[str(src_id)] = int(dest_id)
+            any_added = True
+        if any_added:
+            await _flush_message_map_locked()
+
+
+def lookup_dest_id(pair_name: str, src_id: int) -> Optional[int]:
+    """Return mapped dest id or None if pair/src isn't recorded."""
+    bucket = _msg_map.get(pair_name)
+    if not bucket:
+        return None
+    val = bucket.get(str(src_id))
+    return int(val) if val is not None else None
+
+
+async def forget_mappings(pair_name: str, src_ids) -> None:
+    """Remove recorded entries (called after delete-propagation runs).
+    Stops the map from growing forever for ephemeral source messages."""
+    async with _msg_map_lock:
+        bucket = _msg_map.get(pair_name)
+        if not bucket:
+            return
+        changed = False
+        for sid in src_ids:
+            if bucket.pop(str(sid), None) is not None:
+                changed = True
+        if changed:
+            await _flush_message_map_locked()
 
 
 def load_pairs() -> dict:
@@ -205,6 +317,9 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
     # Telegram requires the SENDING account to have Premium for this flag
     # to work; non-premium accounts should set drop_author:false in their pair.
     drop_author = bool(pair.get("drop_author", True))
+    # Per-pair text replacements (list of {find, replace, regex}). Forces
+    # copy-mode because native forward_messages can't alter message bytes.
+    replacements = pair.get("replacements") or []
 
     watermark = int(state.get(name, {}).get("last_msg_id", 0))
 
@@ -213,11 +328,12 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
     #   - source has forwarding enabled (noforwards=False)
     #   - dest is not a forum topic (telethon 1.43 forward_messages has no
     #     top_msg_id; forum-topic dests stay on copy-mode for now)
+    #   - no replacements configured (forward_messages re-sends original bytes)
     use_native = False
     try:
         src_entity = await dl.client.get_entity(source)
         src_protected = bool(getattr(src_entity, "noforwards", False))
-        if not src_protected and not (dest_topic and dest_topic > 1):
+        if not src_protected and not (dest_topic and dest_topic > 1) and not replacements:
             use_native = True
     except Exception as e:
         print(f"[{name}] couldn't resolve source for noforwards check: {e} — using copy-mode")
@@ -292,12 +408,21 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                 i += len(batch)
                 batch.clear()
                 return False
-            for m, f in zip(batch, forwarded):
+            # Single-message forward_messages returns a Message (not a list)
+            # in some Telethon versions. Normalize so we can always zip.
+            forwarded_list = forwarded if isinstance(forwarded, (list, tuple)) else [forwarded]
+            mappings = []
+            for m, f in zip(batch, forwarded_list):
                 if f is not None:
                     ok += 1
                     last_ok_id = m.id
+                    # f.id is the destination message id — record for live
+                    # edit/delete propagation in server.py event handlers.
+                    mappings.append((m.id, getattr(f, "id", None)))
                 else:
                     fail += 1
+            if mappings:
+                await record_mappings(name, mappings)
             i += len(batch)
             now = int(time.time())
             state[name] = {"last_msg_id": last_ok_id, "updated_at": now}
@@ -364,8 +489,15 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
             print(f"[{name}] cancelled at {i}/{len(msgs)}")
             job["status"] = "cancelled"
             break
-        success = await dl._copy_message_to(m, dest, dest_topic=dest_topic)
-        if success:
+        # Apply per-pair text replacements before send. Pass None when no
+        # rules so _copy_message_to preserves the original entities.
+        override = None
+        if replacements and m.message:
+            transformed = apply_replacements(m.message, replacements)
+            if transformed != m.message:
+                override = transformed
+        sent = await dl._copy_message_to(m, dest, dest_topic=dest_topic, text_override=override)
+        if sent:
             ok += 1
             last_ok_id = m.id
             # Persist watermark per-message so a crash doesn't re-send anything.
@@ -373,6 +505,9 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
             now = int(time.time())
             state[name] = {"last_msg_id": last_ok_id, "updated_at": now}
             await save_pair_watermark(name, last_ok_id, now)
+            dest_msg_id = getattr(sent, "id", None)
+            if dest_msg_id is not None:
+                await record_mappings(name, [(m.id, dest_msg_id)])
         else:
             fail += 1
         if job:

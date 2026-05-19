@@ -1,28 +1,84 @@
 # telegram-forwarder
 
-A small Python CLI that copies messages between Telegram chats, channels, and forum topics — including from channels with "Restrict saving content" enabled (a.k.a. protected chats).
+> Robust Telegram channel forwarder with **atomic watermarks**, **native batch forward + drop_author**, **OOM-safe streaming** for 80k+ message channels, **live edit/delete propagation**, and a web UI. Built on [Telethon](https://github.com/LonamiWebs/Telethon).
 
-Built on [Telethon](https://github.com/LonamiWebs/Telethon). Runs on your own Telegram account.
+Works on protected (restrict-saving) channels via automatic copy-mode fallback. Self-hostable in a single Docker container, runs on a $5 VPS.
 
-## Why
+## Why this exists
 
-Telegram's built-in forward fails on protected channels with `ChatForwardsRestricted`. This tool detects that automatically and switches to **copy mode**: it downloads each message's media to a temp folder and re-uploads it to the destination, preserving captions, hyperlinks, and other inline formatting (bold/italic/code/links).
+Most existing Telegram forwarders (tgcf, telemirror, the small cloners) have at least one of these problems:
+
+- **Duplicate posting** when multiple runners share a single watermark file — concurrent saves clobber each other's keys and the next cycle re-forwards old messages.
+- **OOM crashes** when you try to clone a channel with tens of thousands of messages (they build the full message list in RAM before forwarding).
+- **One-at-a-time copy mode** even on un-protected sources — wastes bandwidth and runs ~50× slower than necessary.
+- **No live edit/delete propagation** — when the source channel edits a message, the mirror goes stale.
+
+This tool fixes all four:
+
+- Atomic per-pair read-modify-write watermark with regression protection (`automate.save_pair_watermark`).
+- Streaming `iter_messages(reverse=True, min_id=watermark)` with per-batch flush — memory stays flat regardless of channel size.
+- Native server-side `forward_messages` at 100 messages per call, with `drop_author=True` to strip the "Forwarded from X" header — falls back to copy mode only when the source forbids forwarding or replacements are configured.
+- Telethon event handlers on `MessageEdited` / `MessageDeleted` with a persistent `src_id → dest_id` map.
+
+## Compared to similar tools
+
+| Feature | this repo | [tgcf](https://github.com/aahnik/tgcf) | [telemirror](https://github.com/khoben/telemirror) |
+|---|---|---|---|
+| Stars at time of writing | 0 (new) | 1.6k | 303 |
+| Last commit (as of 2026-05) | active | Dec 2022 (stale) | active |
+| Atomic concurrent watermark save | ✅ | ⚠ vulnerable | ⚠ vulnerable |
+| OOM-safe streaming on 80k+ channels | ✅ | ❌ builds full list | ❌ builds full list |
+| Native batch forward (100/call) | ✅ | ❌ one-at-a-time | ⚠ partial |
+| `drop_author=True` (strip forward tag) | ✅ | ❌ | ❌ |
+| Auto copy-mode for protected sources | ✅ | ✅ | ✅ |
+| Live edit/delete propagation | ✅ | ❌ | ✅ |
+| Per-pair regex find/replace | ✅ | ✅ | ⚠ partial |
+| Forum-clone end-to-end (create supergroup + mirror topics) | ✅ | ❌ | ❌ |
+| Web UI for pair management | ✅ | ✅ | ❌ |
+| Pause / resume kill switch | ✅ | ❌ | ❌ |
+| Single Docker container | ✅ | ✅ | ✅ |
+
+See [CREDITS.md](CREDITS.md) for the inspiration we drew from tgcf (text replacement plugin pattern) and telemirror (live edit/delete pattern).
 
 ## Features
 
-- Forward an entire channel/chat or just the latest N messages
-- Forward a single forum **topic** (uses `iter_messages(reply_to=topic_id)` — no full-chat scan)
-- Automatic copy-mode fallback for protected sources
-- Preserves text formatting and inline hyperlinks
-- Download media (documents, photos, videos) to local disk
-- Export message history to JSON
-- FloodWait-aware: sleeps when Telegram tells it to
-- **Long-running automation** (`automate.py`): config-driven (source, dest, type) pairs polled on an interval, watermark per pair so only new messages get copied.
-- **Web UI** (`server.py`): browse chats, add/edit/delete recurring pairs, trigger one-shot forwards, view run history — all in one page behind HTTP Basic Auth. Includes Dockerfile + Railway config.
-- **Forum cloning end-to-end**: one click creates a new private supergroup, mirrors every source topic, and registers one recurring pair per topic.
-- **Bulk backfill**: kick off all (or a filtered subset of) pairs serially with `POST /api/run-all`. Each pair appears as a separate job in the live tracker.
-- **Live job tracker** with per-pair progress bars, cancel buttons that work mid-scan (not just between message copies), and inline edit on every pair row.
-- **Pause / Resume** kill switch (`POST /api/pause` / `POST /api/resume`): cancels every in-flight job, halts the scheduler between cycles, and blocks bulk/manual/one-shot triggers until resumed. One-click in the header.
+**Forwarding modes**
+- Native server-side `forward_messages` at 100/call with optional `drop_author=True` — fast and bandwidth-free.
+- Copy mode (download to temp + re-upload) — automatic fallback when the source is protected (`noforwards=True`) or when per-pair text replacements are configured.
+- Preserves text formatting, inline hyperlinks, and the original filename on documents.
+
+**Backfill at scale**
+- Streaming iteration over `iter_messages(reverse=True, min_id=watermark)` — memory stays flat on arbitrarily large channels.
+- Per-batch flush + atomic watermark save — a crash mid-clone resumes cleanly without dupes or skips.
+- Per-batch error recovery: one bad message (expired media, MessageService, etc.) doesn't stall the run.
+
+**Pair management**
+- Long-running poller (`automate.py`): config-driven (source, dest, type) pairs on an interval. Watermarks survive restarts.
+- Web UI (`server.py`): browse chats, add/edit/delete recurring pairs, trigger one-shot forwards, view run history — all in one page behind HTTP Basic Auth.
+- Forum clone end-to-end: one click creates a new private supergroup, mirrors every source topic, and registers one recurring pair per topic.
+- Bulk backfill: kick off all (or a filtered subset of) pairs serially with `POST /api/run-all`. Each pair appears as a separate job.
+
+**Live mirroring** *(new)*
+- Telethon `MessageEdited` event handler — when the source edits a message, the corresponding mirror message is edited too.
+- `MessageDeleted` event handler — source deletions cascade to the mirror.
+- Persistent `src_id → dest_id` map (`message_map.json`) — atomic writes under an asyncio lock.
+
+**Content transformation** *(new)*
+- Per-pair `replacements` list of `{find, replace, regex}` rules — applied to message text and media captions before sending. Inspired by tgcf's format plugin.
+- Forces copy-mode automatically when configured (native forward can't alter bytes).
+
+**Operations**
+- Pause / resume kill switch (`POST /api/pause` / `POST /api/resume`) — cancels in-flight jobs, halts the scheduler, blocks bulk/manual/one-shot triggers until resumed.
+- Live job tracker with per-pair progress bars and cancel buttons that work mid-scan (not just between message copies).
+- Watermark repair endpoint to roll a pair backwards (re-forward a range) or forwards (skip ahead after a clone).
+- FloodWait-aware throughout: sleeps when Telegram tells it to, retries cleanly.
+
+## When NOT to use this
+
+- **You only want to forward bot-sent messages.** Telethon needs a real user account — use the official Bot API for bot-to-bot forwarding instead.
+- **You expect zero "(edited)" tags on edited messages.** Telegram always tags edited messages, even when the edit is just a caption replacement. Unavoidable.
+- **You need backwards-compatible edits to already-mirrored messages.** Only messages forwarded *after* this version of the tool was running will have `message_map` entries — older messages can't be live-edited retroactively without a separate batch job.
+- **You want to forward from a chat you're not a member of.** Telegram doesn't expose messages to non-members. There's no workaround.
 
 ## Install
 
