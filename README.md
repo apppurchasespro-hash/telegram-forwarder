@@ -82,6 +82,34 @@ See [CREDITS.md](CREDITS.md) for the inspiration we drew from tgcf (text replace
 
 ## Install
 
+### Option A — Pre-built Docker image (recommended)
+
+A multi-tag image is published to GHCR on every push to `main` and on every `vX.Y.Z` tag.
+
+```bash
+docker pull ghcr.io/apppurchasespro-hash/telegram-forwarder:latest
+```
+
+Tags available: `latest`, `main`, `sha-<short>` (built per main-branch push), plus `vX.Y.Z` / `X.Y` / `X` (built per release tag — pin to a specific version if you don't want surprise updates).
+
+Minimal run (after you've generated a session string — see [Setup](#setup)):
+
+```bash
+docker run -d --name tg-forwarder \
+  -p 5000:8080 \
+  -v "$PWD/data:/app/data" \
+  -e TELEGRAM_API_ID=12345678 \
+  -e TELEGRAM_API_HASH=your_api_hash_here \
+  -e TELETHON_SESSION_STRING="$(cat session_string.txt)" \
+  -e DASH_USER=admin \
+  -e DASH_PASS=pick-a-strong-password \
+  ghcr.io/apppurchasespro-hash/telegram-forwarder:latest
+```
+
+UI on <http://localhost:5000>. The `/app/data` volume keeps `pairs.json`, `watermarks.json`, `run_log.json`, and `message_map.json` across container restarts and image upgrades.
+
+### Option B — From source
+
 Python 3.11+ recommended.
 
 ```bash
@@ -295,7 +323,7 @@ Internally, per-message watermark saves go through `automate.py::save_pair_water
 
 ### Deploy on Railway (24/7)
 
-This repo includes `Dockerfile` and `railway.json` for a one-service deployment that runs both the UI and the scheduler.
+This repo includes `Dockerfile` and `railway.json` for a one-service deployment that runs both the UI and the scheduler. You can either point Railway at the repo (it builds from source) or at the pre-built GHCR image — the latter is faster and doesn't burn Railway build minutes.
 
 1. **Generate a session string locally** (one-time):
 
@@ -306,7 +334,9 @@ This repo includes `Dockerfile` and `railway.json` for a one-service deployment 
 
    Treat `session_string.txt` like a password — it grants full account access.
 
-2. **Create a new Railway project** from this repo (`apppurchasespro-hash/telegram-forwarder`).
+2. **Create a new Railway project.** Either:
+   - **Deploy from image** (recommended): pick "Deploy from Docker image" and use `ghcr.io/apppurchasespro-hash/telegram-forwarder:latest` (or pin to `:vX.Y.Z`). Zero build time.
+   - **Deploy from repo**: point at `apppurchasespro-hash/telegram-forwarder` and Railway will build the `Dockerfile` itself.
 
 3. **Set env vars** in the Railway service:
 
