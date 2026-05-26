@@ -258,6 +258,17 @@ async def api_pairs_post():
         # When paused, scheduler skips this pair. Manual runs still work.
         if "paused" in body:
             new_pair["paused"] = bool(body["paused"])
+        # Copy-mode media size cap (MB). 0/missing = unlimited. Only consulted
+        # in copy-mode runs — native forwards always relay server-side.
+        if "max_file_size_mb" in body:
+            raw = body.get("max_file_size_mb")
+            if raw not in (None, "", "null"):
+                try:
+                    v = int(raw)
+                    if v > 0:
+                        new_pair["max_file_size_mb"] = v
+                except (TypeError, ValueError):
+                    return jsonify({"error": "max_file_size_mb must be a non-negative integer"}), 400
         # Optional per-pair text replacements. Schema is a list of
         # {find, replace, regex?} dicts. Pairs with replacements stay on the
         # native path — run_pair forwards server-side and then edits the dest

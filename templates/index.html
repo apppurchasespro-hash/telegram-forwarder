@@ -119,13 +119,17 @@
             <input name="delay_seconds" type="number" value="1.0" step="0.1" min="0" class="w-full border border-slate-300 rounded px-2 py-1">
           </label>
           <label>
+            <span class="block text-xs text-slate-500 mb-1">Max file size <span class="text-slate-400">(MB, copy-mode only; 0 = unlimited)</span></span>
+            <input name="max_file_size_mb" type="number" value="0" min="0" class="w-full border border-slate-300 rounded px-2 py-1">
+          </label>
+          <label>
             <span class="block text-xs text-slate-500 mb-1">Run interval (s, applies globally)</span>
             <input name="interval_seconds" type="number" value="3600" min="60" class="w-full border border-slate-300 rounded px-2 py-1">
           </label>
           <label class="col-span-2">
             <span class="block text-xs text-slate-500 mb-1">
               Caption replacements
-              <span class="text-slate-400">(one rule per line — forces copy-mode)</span>
+              <span class="text-slate-400">(one rule per line — native forward + edit caption after)</span>
             </span>
             <textarea name="replacements" rows="4" placeholder="Examples:&#10;regex:https?://\S+ =>&#10;regex:@\w+ =>&#10;EIH PAID =>&#10;spam-word => clean-word&#10;&#10;Format: find=>replace (literal)&#10;or:     regex:pattern=>replace&#10;Blank replace = delete the match." class="w-full border border-slate-300 rounded px-2 py-1 mono text-xs"></textarea>
           </label>
@@ -533,6 +537,7 @@ $('#pairs-tbody').addEventListener('click', async (e) => {
     f.type.value = p.type || 'all';
     f.max_per_run.value = p.max_per_run ?? 200;
     f.delay_seconds.value = p.delay_seconds ?? 1.0;
+    if (f.max_file_size_mb) f.max_file_size_mb.value = p.max_file_size_mb ?? 0;
     // Format replacements as one rule per line for the textarea.
     if (f.replacements) {
       f.replacements.value = (p.replacements || [])
