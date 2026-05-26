@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodWaitError, MessageNotModifiedError
 
 from downloader import TelegramDownloader, load_config
 
@@ -122,6 +122,16 @@ async def record_mappings(pair_name: str, pairs_iter) -> None:
             any_added = True
         if any_added:
             await _flush_message_map_locked()
+
+
+def mapped_src_ids(pair_name: str) -> set[int]:
+    """Return the set of source msg ids already forwarded for this pair.
+    Reads from in-memory _msg_map (loaded at server startup, updated atomically
+    by record_mappings). Used by the /gaps endpoint to compute missing ids."""
+    bucket = _msg_map.get(pair_name)
+    if not bucket:
+        return set()
+    return {int(k) for k in bucket.keys()}
 
 
 def lookup_dest_id(pair_name: str, src_id: int) -> Optional[int]:
@@ -253,6 +263,26 @@ def _pair_key(pair: dict) -> str:
     return pair.get("name") or f"{pair['source']}:{pair['dest']}"
 
 
+def _msg_media_size_bytes(msg) -> int:
+    """Largest media-attachment size in bytes, or 0 if no media.
+    Used by the per-pair `max_file_size_mb` filter to skip huge files in
+    copy-mode WITHOUT attempting download (which would burn ~5 min via the
+    300s `wait_for` cap before timing out). Native forwards don't care
+    because Telegram relays the bytes server-side."""
+    if getattr(msg, "document", None):
+        return getattr(msg.document, "size", 0) or 0
+    if getattr(msg, "video", None):
+        return getattr(msg.video, "size", 0) or 0
+    if getattr(msg, "audio", None):
+        return getattr(msg.audio, "size", 0) or 0
+    if getattr(msg, "voice", None):
+        return getattr(msg.voice, "size", 0) or 0
+    if getattr(msg, "photo", None):
+        sizes = getattr(msg.photo, "sizes", []) or []
+        return max((getattr(s, "size", 0) or 0) for s in sizes) if sizes else 0
+    return 0
+
+
 def _matches_type(msg, ftype: str, dl: TelegramDownloader) -> bool:
     # Telegram service messages ("user joined", "channel created", "pinned X",
     # etc.) cannot be forwarded — forward_messages errors out and copy-mode has
@@ -305,6 +335,11 @@ async def run_pair(dl: TelegramDownloader, pair: dict, state: dict, job: Optiona
 
 async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job: Optional[dict] = None) -> dict:
     name = _pair_key(pair)
+    # Transition job out of "queued" immediately so the dashboard shows the
+    # correct state even for zero-work runs (no new msgs → fast path returns
+    # before any batch flush, so we'd otherwise stay stuck on queued).
+    if job and job.get("status") == "queued":
+        job["status"] = "running"
     source = pair["source"]
     dest = pair["dest"]
     source_topic = pair.get("source_topic")
@@ -317,23 +352,29 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
     # Telegram requires the SENDING account to have Premium for this flag
     # to work; non-premium accounts should set drop_author:false in their pair.
     drop_author = bool(pair.get("drop_author", True))
-    # Per-pair text replacements (list of {find, replace, regex}). Forces
-    # copy-mode because native forward_messages can't alter message bytes.
+    # Per-pair text replacements (list of {find, replace, regex}). Stays on
+    # the native path: forward server-side, then edit the dest caption with
+    # apply_replacements(text). Two API calls per changed msg vs a full
+    # download+upload — still ~100x faster than copy-mode.
     replacements = pair.get("replacements") or []
 
     watermark = int(state.get(name, {}).get("last_msg_id", 0))
 
     # Pick transport: native server-side forward (fast, no bandwidth) when
-    # allowed, otherwise copy-mode (download + re-upload). Native requires:
-    #   - source has forwarding enabled (noforwards=False)
-    #   - dest is not a forum topic (telethon 1.43 forward_messages has no
-    #     top_msg_id; forum-topic dests stay on copy-mode for now)
-    #   - no replacements configured (forward_messages re-sends original bytes)
+    # allowed, otherwise copy-mode (download + re-upload). Native works for:
+    #   - any non-protected source (noforwards=False)
+    #   - forum-topic dests (via raw ForwardMessagesRequest with top_msg_id —
+    #     see dl.forward_batch)
+    #   - pairs WITH replacements: forward first, then edit_message the dest
+    #     caption with apply_replacements(text). Two API calls per msg instead
+    #     of a download+upload — still 100x faster than copy-mode.
+    # Only blocker: source has forwarding disabled (noforwards=True) → must
+    # fall back to copy-mode because the bytes can't leave the channel.
     use_native = False
     try:
         src_entity = await dl.client.get_entity(source)
         src_protected = bool(getattr(src_entity, "noforwards", False))
-        if not src_protected and not (dest_topic and dest_topic > 1) and not replacements:
+        if not src_protected:
             use_native = True
     except Exception as e:
         print(f"[{name}] couldn't resolve source for noforwards check: {e} — using copy-mode")
@@ -381,13 +422,20 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
             nonlocal ok, fail, last_ok_id, i, batch, progress_printed_at
             if not batch:
                 return False
+            # Route through dl.forward_batch when dest is a forum topic so
+            # top_msg_id is set on the raw ForwardMessagesRequest. Otherwise
+            # use the high-level wrapper (faster init, same result).
+            async def _do_forward():
+                if dest_topic and dest_topic > 1:
+                    return await dl.forward_batch(source, dest, batch, drop_author=drop_author, top_msg_id=dest_topic)
+                return await dl.client.forward_messages(dest, batch, source, drop_author=drop_author)
             try:
-                forwarded = await dl.client.forward_messages(dest, batch, source, drop_author=drop_author)
+                forwarded = await _do_forward()
             except FloodWaitError as fw:
                 print(f"[{name}] flood wait {fw.seconds}s")
                 await asyncio.sleep(fw.seconds)
                 try:
-                    forwarded = await dl.client.forward_messages(dest, batch, source, drop_author=drop_author)
+                    forwarded = await _do_forward()
                 except Exception as e:
                     print(f"[{name}] batch failed after flood-wait retry: {e} — skipping {len(batch)} msgs (last id #{batch[-1].id})")
                     fail += len(batch)
@@ -412,17 +460,46 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
             # in some Telethon versions. Normalize so we can always zip.
             forwarded_list = forwarded if isinstance(forwarded, (list, tuple)) else [forwarded]
             mappings = []
+            edits = []  # (src_id, dest_id, new_text) — applied after record_mappings
             for m, f in zip(batch, forwarded_list):
                 if f is not None:
                     ok += 1
                     last_ok_id = m.id
                     # f.id is the destination message id — record for live
                     # edit/delete propagation in server.py event handlers.
-                    mappings.append((m.id, getattr(f, "id", None)))
+                    dest_id = getattr(f, "id", None)
+                    mappings.append((m.id, dest_id))
+                    # Post-forward caption rewrite: native forward re-sent the
+                    # original bytes verbatim, so any replacements in pair config
+                    # have to be applied as a follow-up edit on the dest msg.
+                    if replacements and m.message and dest_id is not None:
+                        new_text = apply_replacements(m.message, replacements)
+                        if new_text != m.message:
+                            edits.append((m.id, dest_id, new_text))
                 else:
                     fail += 1
             if mappings:
                 await record_mappings(name, mappings)
+            # Apply caption rewrites after the mapping is durable — if an edit
+            # crashes we still know the forward happened. parse_mode=None sends
+            # the cleaned text as plain (no markdown), so leftover `*`/`_`/`[`
+            # from regex strips don't trip Telethon's entity parser with
+            # "Failed to parse message".
+            for src_id, dest_id, new_text in edits:
+                try:
+                    await dl.client.edit_message(dest, dest_id, new_text, parse_mode=None)
+                except FloodWaitError as fw:
+                    print(f"[{name}] edit-after flood wait {fw.seconds}s at src#{src_id}")
+                    await asyncio.sleep(fw.seconds + 1)
+                    try:
+                        await dl.client.edit_message(dest, dest_id, new_text, parse_mode=None)
+                    except Exception as e:
+                        print(f"[{name}] edit src#{src_id}->dst#{dest_id} retry failed: {e}")
+                except MessageNotModifiedError:
+                    pass
+                except Exception as e:
+                    print(f"[{name}] edit src#{src_id}->dst#{dest_id} failed: {type(e).__name__}: {e}")
+                await asyncio.sleep(0.25)
             i += len(batch)
             now = int(time.time())
             state[name] = {"last_msg_id": last_ok_id, "updated_at": now}
@@ -456,18 +533,32 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
         print(f"[{name}] done: forwarded={ok} failed={fail} new_watermark=#{last_ok_id}")
         return {"forwarded": ok, "failed": fail, "last_id": last_ok_id}
 
-    # ── Copy-mode (protected source or forum-topic dest) — per-message D+U.
+    # ── Copy-mode (protected source) — per-message download + upload.
     # Still builds the full list first; copy mode is slow per-message anyway so
     # the scan overhead is negligible relative to one big file's upload time.
+    # `max_file_size_mb` per-pair filter skips huge files BEFORE attempting
+    # download — without it, a 1GB video burns ~5 min via the 300s wait_for cap
+    # in `dl._copy_message_to` before timing out. 0 / missing = unlimited.
+    max_size_bytes = int(pair.get("max_file_size_mb", 0) or 0) * 1024 * 1024
     msgs = []
+    skipped_oversize = 0
     async for m in dl.client.iter_messages(source, **iter_kwargs):
         if job and job.get("cancel"):
             print(f"[{name}] cancelled during scan ({len(msgs)} matched so far)")
             job["status"] = "cancelled"
             job["finished_at"] = int(time.time())
             return {"forwarded": 0, "failed": 0, "last_id": watermark, "cancelled": True}
-        if _matches_type(m, ftype, dl):
-            msgs.append(m)
+        if not _matches_type(m, ftype, dl):
+            continue
+        if max_size_bytes > 0:
+            sz = _msg_media_size_bytes(m)
+            if sz > max_size_bytes:
+                skipped_oversize += 1
+                print(f"[{name}] skip #{m.id}: media {sz // (1024*1024)} MB > cap {pair.get('max_file_size_mb')} MB")
+                continue
+        msgs.append(m)
+    if skipped_oversize:
+        print(f"[{name}] filter: skipped {skipped_oversize} oversize msg(s) — they'll be re-evaluated next run if cap is raised")
 
     msgs.sort(key=lambda m: m.id)
     if max_per_run:
@@ -489,6 +580,20 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
             print(f"[{name}] cancelled at {i}/{len(msgs)}")
             job["status"] = "cancelled"
             break
+        # Per-message "starting" line so a stall surfaces immediately. We print
+        # which message we're about to process; if the engine hangs, the last
+        # printed line points at the culprit. flush=True bypasses stdout buffering.
+        media_kind = ""
+        if getattr(m, "photo", None):
+            media_kind = " photo"
+        elif getattr(m, "document", None):
+            dsize = getattr(m.document, "size", 0) or 0
+            media_kind = f" doc/{dsize // 1024}KB" if dsize else " doc"
+        elif getattr(m, "video", None):
+            media_kind = " video"
+        elif getattr(m, "media", None):
+            media_kind = " media"
+        print(f"[{name}] → {i}/{len(msgs)} src#{m.id}{media_kind}", flush=True)
         # Apply per-pair text replacements before send. Pass None when no
         # rules so _copy_message_to preserves the original entities.
         override = None
@@ -512,8 +617,8 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
             fail += 1
         if job:
             job.update({"done": i, "ok": ok, "fail": fail, "last_id": last_ok_id})
-        if i % 10 == 0 or i == len(msgs):
-            print(f"[{name}] progress {i}/{len(msgs)} (ok={ok} fail={fail})")
+        if i % 25 == 0 or i == len(msgs):
+            print(f"[{name}] progress {i}/{len(msgs)} (ok={ok} fail={fail})", flush=True)
         await asyncio.sleep(delay)
     if job and job["status"] == "running":
         job["status"] = "finished"

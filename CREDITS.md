@@ -47,8 +47,10 @@ borrowed from anywhere we know of:
   jobs + bulks and blocks the scheduler from launching new pair runs.
 - **Native server-side batch forward with `drop_author=True`** — 100
   messages per `forward_messages` call, "Forwarded from X" header stripped.
-  Falls back to copy-mode automatically when the source forbids forwarding,
-  when the destination is a forum topic, or when replacements are configured.
+  Falls back to copy-mode only when the source forbids forwarding
+  (`noforwards=True`). Forum-topic destinations stay on the native path via
+  raw `ForwardMessagesRequest` with `top_msg_id`; per-pair replacements stay
+  on it too by editing the destination caption after forwarding.
 - **Streaming iteration** (`iter_messages(reverse=True, min_id=watermark)`)
   with per-batch flush — handles 80 k+ message channels in flat memory.
 - **Forum clone-end-to-end endpoint** (`/api/clone-forum`) — create dest
@@ -57,6 +59,6 @@ borrowed from anywhere we know of:
 
 ## License of this project
 
-(Unspecified at the time of writing.) The borrowed ideas above are credited
-under their original licenses; if you redistribute any of the
-clearly-credited helpers, please carry the credit forward.
+MIT — see [LICENSE](LICENSE). The borrowed ideas above are credited under
+their original licenses; if you redistribute any of the clearly-credited
+helpers, please carry the credit forward.

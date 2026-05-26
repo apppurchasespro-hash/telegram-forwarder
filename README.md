@@ -17,7 +17,7 @@ This tool fixes all four:
 
 - Atomic per-pair read-modify-write watermark with regression protection (`automate.save_pair_watermark`).
 - Streaming `iter_messages(reverse=True, min_id=watermark)` with per-batch flush — memory stays flat regardless of channel size.
-- Native server-side `forward_messages` at 100 messages per call, with `drop_author=True` to strip the "Forwarded from X" header — falls back to copy mode only when the source forbids forwarding or replacements are configured.
+- Native server-side `forward_messages` at 100 messages per call, with `drop_author=True` to strip the "Forwarded from X" header — falls back to copy mode only when the source forbids forwarding (`noforwards=True`). Per-pair text replacements stay on the native path and are applied as a follow-up `edit_message` on the destination caption.
 - Telethon event handlers on `MessageEdited` / `MessageDeleted` with a persistent `src_id → dest_id` map.
 
 ## Compared to similar tools
@@ -43,8 +43,8 @@ See [CREDITS.md](CREDITS.md) for the inspiration we drew from tgcf (text replace
 ## Features
 
 **Forwarding modes**
-- Native server-side `forward_messages` at 100/call with optional `drop_author=True` — fast and bandwidth-free.
-- Copy mode (download to temp + re-upload) — automatic fallback when the source is protected (`noforwards=True`) or when per-pair text replacements are configured.
+- Native server-side `forward_messages` at 100/call with optional `drop_author=True` — fast and bandwidth-free. Also used when the destination is a forum topic (via raw `ForwardMessagesRequest` with `top_msg_id`).
+- Copy mode (download to temp + re-upload) — automatic fallback only when the source is protected (`noforwards=True`).
 - Preserves text formatting, inline hyperlinks, and the original filename on documents.
 
 **Backfill at scale**
@@ -64,8 +64,8 @@ See [CREDITS.md](CREDITS.md) for the inspiration we drew from tgcf (text replace
 - Persistent `src_id → dest_id` map (`message_map.json`) — atomic writes under an asyncio lock.
 
 **Content transformation** *(new)*
-- Per-pair `replacements` list of `{find, replace, regex}` rules — applied to message text and media captions before sending. Inspired by tgcf's format plugin.
-- Forces copy-mode automatically when configured (native forward can't alter bytes).
+- Per-pair `replacements` list of `{find, replace, regex}` rules — applied to message text and media captions. Inspired by tgcf's format plugin.
+- Stays on the fast native-forward path: each batch is server-side forwarded, then `edit_message` rewrites the destination caption with the transformed text (two API calls per changed message instead of a full download + re-upload). Caption edits use `parse_mode=None` so stray `*`/`_`/`[` left over from regex strips don't trip Telethon's markdown parser.
 
 **Operations**
 - Pause / resume kill switch (`POST /api/pause` / `POST /api/resume`) — cancels in-flight jobs, halts the scheduler, blocks bulk/manual/one-shot triggers until resumed.
@@ -159,7 +159,7 @@ python cli.py forward-topic \
   --delay 0.5
 ```
 
-The general topic (id=1) requires a full scan; named topics are fetched directly via `messages.getReplies`.
+The general topic (id=1) requires a full scan; named topics are fetched directly via `messages.getReplies`. `forward-topic` also accepts `--type docs_and_text` (documents + text-only, skips photos/voice notes) in addition to the four types above.
 
 ### Download media to disk
 
@@ -205,17 +205,37 @@ python automate.py
       "name": "my-feed",
       "source": -1001234567890,
       "dest":   -1009876543210,
+      "source_topic": 141,
+      "dest_topic":   13,
       "type":   "all",
       "delay_seconds": 1.0,
-      "max_per_run":   200
+      "max_per_run":   2000,
+      "drop_author": true,
+      "paused": false,
+      "max_file_size_mb": 0,
+      "replacements": [
+        {"find": "Join @oldchannel", "replace": "Visit @newchannel"},
+        {"find": "https?://t\\.me/\\S+", "replace": "", "regex": true}
+      ]
     }
   ]
 }
 ```
 
-- `name` — unique key for the watermark. Don't change after first run.
-- `type` — `all`, `media`, `documents`, or `messages` (same as the CLI).
-- `max_per_run` — per-run cap; protects you from FloodWait if the source has a backlog.
+| Field | Required | Default | Notes |
+|---|---|---|---|
+| `name` | yes | — | Unique watermark key. Don't rename after first run. |
+| `source` | yes | — | Negative chat id (`-100…` for channels/supergroups). |
+| `dest` | yes | — | Negative chat id. |
+| `source_topic` | no | — | Forum topic id. `1` = General (requires full chat scan). Skip for non-forum sources. |
+| `dest_topic` | no | — | Destination forum topic id. Skip if dest is not a forum. |
+| `type` | no | `all` | One of `all` / `media` / `documents` / `messages` / `docs_and_text`. |
+| `delay_seconds` | no | `1.0` | Seconds between sends. Raise on FloodWait. |
+| `max_per_run` | no | `0` (unlimited) | Per-run cap; protects you from FloodWait if the source has a backlog. |
+| `drop_author` | no | `true` | Strip "Forwarded from X" header on native forwards. Requires Premium sending account. |
+| `paused` | no | `false` | `true` makes the scheduler skip this pair. Manual `/api/pairs/<name>/run` still works. |
+| `max_file_size_mb` | no | `0` (unlimited) | Copy-mode only: skip messages whose media exceeds this cap **before** download. |
+| `replacements` | no | `[]` | List of `{find, replace, regex?}` rules. Forwards natively + edits caption after — does **not** force copy-mode. |
 
 `RUN_ONCE_AND_EXIT=1 python automate.py` runs one pass and exits — useful for testing or one-shot cron jobs.
 

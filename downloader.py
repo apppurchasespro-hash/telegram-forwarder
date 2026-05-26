@@ -15,8 +15,8 @@ from typing import Optional, Callable
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.tl.functions.messages import GetForumTopicsRequest
-from telethon.tl.types import ForumTopic, MessageMediaWebPage, DocumentAttributeFilename
+from telethon.tl.functions.messages import GetForumTopicsRequest, ForwardMessagesRequest
+from telethon.tl.types import ForumTopic, MessageMediaWebPage, DocumentAttributeFilename, UpdateNewChannelMessage, UpdateNewMessage
 from telethon.errors import FloodWaitError
 
 if hasattr(sys.stdout, "reconfigure") and sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
@@ -156,6 +156,7 @@ class TelegramDownloader:
                 "type": chat_type,
                 "members_count": getattr(entity, "participants_count", None),
                 "unread_count": dialog.unread_count,
+                "noforwards": bool(getattr(entity, "noforwards", False)),
             })
         return chats
 
@@ -335,7 +336,20 @@ class TelegramDownloader:
                 elif msg.photo:
                     ext = ".jpg"
                 safe_temp = temp_dir / f"tmp_{msg.id}{ext}"
-                temp_path = await self.client.download_media(msg, file=str(safe_temp))
+                # Per-file timeouts so a stalled CDN doesn't deadlock the whole pair.
+                # Large videos can legitimately take 2-3 min; 300s is a safe ceiling.
+                try:
+                    temp_path = await asyncio.wait_for(
+                        self.client.download_media(msg, file=str(safe_temp)),
+                        timeout=300,
+                    )
+                except asyncio.TimeoutError:
+                    print(f"\n  ⏱ Skipping msg #{msg.id}: download timed out after 300s")
+                    try:
+                        safe_temp.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    return None
                 if not temp_path:
                     return None
                 caption = text_override if use_override else (msg.message or "")
@@ -347,7 +361,18 @@ class TelegramDownloader:
                     send_kwargs["attributes"] = [DocumentAttributeFilename(original_name)]
                 if reply_to:
                     send_kwargs["reply_to"] = reply_to
-                sent = await self.client.send_file(dest_id, temp_path, **send_kwargs)
+                try:
+                    sent = await asyncio.wait_for(
+                        self.client.send_file(dest_id, temp_path, **send_kwargs),
+                        timeout=300,
+                    )
+                except asyncio.TimeoutError:
+                    print(f"\n  ⏱ Skipping msg #{msg.id}: upload timed out after 300s")
+                    try:
+                        os.remove(temp_path)
+                    except OSError:
+                        pass
+                    return None
                 try:
                     os.remove(temp_path)
                 except OSError:
@@ -370,6 +395,60 @@ class TelegramDownloader:
         except Exception as e:
             print(f"\n  ✗ Failed msg #{msg.id}: {e}")
             return None
+
+    async def forward_batch(self, source, dest, msgs, *, drop_author: bool = True,
+                            top_msg_id: int | None = None):
+        """Native server-side forward via raw ForwardMessagesRequest.
+
+        Unlike client.forward_messages(), this exposes top_msg_id so we can
+        forward into a forum-topic destination without falling back to copy-mode.
+        Returns a list of forwarded Message objects (same length as input,
+        with None for any that the server didn't echo back in the Updates).
+        """
+        import random
+        from_peer = await self.client.get_input_entity(source)
+        to_peer = await self.client.get_input_entity(dest)
+        ids = [m.id for m in msgs]
+        random_ids = [random.getrandbits(63) for _ in ids]
+        kwargs = {
+            "from_peer": from_peer,
+            "id": ids,
+            "to_peer": to_peer,
+            "random_id": random_ids,
+            "drop_author": drop_author,
+        }
+        if top_msg_id and top_msg_id > 1:
+            kwargs["top_msg_id"] = top_msg_id
+        result = await self.client(ForwardMessagesRequest(**kwargs))
+        # Result is an Updates object. Pull out the newly-created messages
+        # by matching random_id back to the input order.
+        rid_to_msg: dict[int, object] = {}
+        for upd in getattr(result, "updates", []):
+            if isinstance(upd, (UpdateNewChannelMessage, UpdateNewMessage)):
+                msg = upd.message
+                rid = getattr(msg, "random_id", None) or getattr(upd, "random_id", None)
+                if rid is not None:
+                    rid_to_msg[rid] = msg
+        # Telethon sometimes exposes random_id mapping via result.updates with
+        # UpdateMessageID. Fall back to scanning those too.
+        from telethon.tl.types import UpdateMessageID
+        rid_to_dest_id: dict[int, int] = {}
+        for upd in getattr(result, "updates", []):
+            if isinstance(upd, UpdateMessageID):
+                rid_to_dest_id[upd.random_id] = upd.id
+        out: list = []
+        for rid in random_ids:
+            if rid in rid_to_msg:
+                out.append(rid_to_msg[rid])
+            elif rid in rid_to_dest_id:
+                # Synthesize a minimal stub so caller can read .id
+                class _Stub: pass
+                s = _Stub()
+                s.id = rid_to_dest_id[rid]
+                out.append(s)
+            else:
+                out.append(None)
+        return out
 
     # ─── Forward topic ────────────────────────────────────────────
 

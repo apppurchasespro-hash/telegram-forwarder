@@ -16,6 +16,9 @@
     .pill-ok { background:#dcfce7; color:#166534; }
     .pill-err { background:#fee2e2; color:#991b1b; }
     .pill-running { background:#dbeafe; color:#1e3a8a; }
+    .pill-protected { background:#fee2e2; color:#991b1b; }
+    .pill-forwardable { background:#dcfce7; color:#166534; }
+    .pill-paused { background:#e2e8f0; color:#475569; }
     .toast { position:fixed; bottom:20px; right:20px; padding:12px 16px; border-radius:8px; box-shadow:0 4px 12px rgba(0,0,0,.15); z-index:50; }
     .toast-ok { background:#dcfce7; color:#166534; }
     .toast-err { background:#fee2e2; color:#991b1b; }
@@ -108,8 +111,8 @@
             </select>
           </label>
           <label>
-            <span class="block text-xs text-slate-500 mb-1">Max per run</span>
-            <input name="max_per_run" type="number" value="200" min="1" class="w-full border border-slate-300 rounded px-2 py-1">
+            <span class="block text-xs text-slate-500 mb-1">Max per run <span class="text-slate-400">(0 = unlimited until flood-wait)</span></span>
+            <input name="max_per_run" type="number" value="200" min="0" class="w-full border border-slate-300 rounded px-2 py-1">
           </label>
           <label>
             <span class="block text-xs text-slate-500 mb-1">Delay between sends (s)</span>
@@ -118,6 +121,13 @@
           <label>
             <span class="block text-xs text-slate-500 mb-1">Run interval (s, applies globally)</span>
             <input name="interval_seconds" type="number" value="3600" min="60" class="w-full border border-slate-300 rounded px-2 py-1">
+          </label>
+          <label class="col-span-2">
+            <span class="block text-xs text-slate-500 mb-1">
+              Caption replacements
+              <span class="text-slate-400">(one rule per line — forces copy-mode)</span>
+            </span>
+            <textarea name="replacements" rows="4" placeholder="Examples:&#10;regex:https?://\S+ =>&#10;regex:@\w+ =>&#10;EIH PAID =>&#10;spam-word => clean-word&#10;&#10;Format: find=>replace (literal)&#10;or:     regex:pattern=>replace&#10;Blank replace = delete the match." class="w-full border border-slate-300 rounded px-2 py-1 mono text-xs"></textarea>
           </label>
           <div class="col-span-2 flex justify-end">
             <button type="submit" class="bg-blue-600 hover:bg-blue-700 text-white text-sm px-4 py-1.5 rounded">Save pair</button>
@@ -217,8 +227,8 @@
             </select>
           </label>
           <label>
-            <span class="block text-xs text-slate-500 mb-1">Max per run (per pair)</span>
-            <input name="max_per_run" type="number" value="200" min="1" class="w-full border border-slate-300 rounded px-2 py-1">
+            <span class="block text-xs text-slate-500 mb-1">Max per run (per pair) <span class="text-slate-400">(0 = unlimited)</span></span>
+            <input name="max_per_run" type="number" value="200" min="0" class="w-full border border-slate-300 rounded px-2 py-1">
           </label>
           <label class="col-span-2 flex items-center gap-2 text-xs text-slate-600">
             <input name="skip_general" type="checkbox" checked class="rounded">
@@ -233,7 +243,7 @@
       <!-- Running jobs -->
       <div class="bg-white border border-slate-200 rounded-lg p-4">
         <div class="flex items-center justify-between mb-3">
-          <h2 class="font-semibold">Active &amp; recent jobs</h2>
+          <h2 class="font-semibold">Active jobs</h2>
           <span id="jobs-count" class="text-xs text-slate-500"></span>
         </div>
         <div id="jobs-list" class="space-y-2 text-sm max-h-[40vh] overflow-y-auto">
@@ -301,18 +311,28 @@ async function loadChats() {
   }
 }
 
+function normalizeText(s) {
+  // NFKD decomposes Mathematical Bold (𝐕𝐄𝐑𝐒𝐄), fullwidth, accented, etc. → ASCII.
+  // Then strip combining marks left behind by accent decomposition.
+  return (s || '').normalize('NFKD').replace(/[̀-ͯ]/g, '').toLowerCase();
+}
+
 function renderChats() {
-  const q = $('#chat-search').value.toLowerCase().trim();
+  const q = normalizeText($('#chat-search').value).trim();
   const filtered = CHATS.filter(c => {
     if (FILTER !== 'all' && c.type !== FILTER) return false;
     if (!q) return true;
-    return (c.title || '').toLowerCase().includes(q) || String(c.id).includes(q);
+    return normalizeText(c.title).includes(q) || String(c.id).includes(q);
   });
-  const html = filtered.slice(0, 200).map(c => `
+  const html = filtered.slice(0, 200).map(c => {
+    const forwardBadge = c.noforwards
+      ? '<span class="pill pill-protected" title="noforwards=true — will use copy mode (download + re-upload)">🔒 protected</span>'
+      : '<span class="pill pill-forwardable" title="native forward_messages works — fast batched mirror">↗ forwardable</span>';
+    return `
     <div class="flex items-center justify-between gap-2 p-2 rounded hover:bg-slate-50">
       <div class="min-w-0 flex-1">
         <div class="font-medium truncate">${escapeHtml(c.title || '?')}</div>
-        <div class="text-xs text-slate-500 mono">${c.id} <span class="pill pill-${c.type}">${c.type}</span></div>
+        <div class="text-xs text-slate-500 mono">${c.id} <span class="pill pill-${c.type}">${c.type}</span> ${forwardBadge}</div>
       </div>
       <div class="flex gap-1">
         <button data-act="copy" data-id="${c.id}" class="text-xs text-slate-600 hover:text-slate-900 px-2 py-0.5 border border-slate-200 rounded">copy id</button>
@@ -320,8 +340,20 @@ function renderChats() {
         <button data-act="dst" data-id="${c.id}" class="text-xs text-emerald-600 hover:underline">-> dest</button>
       </div>
     </div>
-  `).join('');
+  `;
+  }).join('');
   $('#chats-list').innerHTML = html || '<p class="text-slate-400 text-xs">no matches</p>';
+}
+
+function setInputAndLoadTopics(input, id) {
+  input.value = id;
+  // Programmatic .value assignments don't fire 'input' events, so explicitly
+  // load topics for the paired select (if any).
+  const key = input.dataset.topicInput;
+  if (key) {
+    const select = document.querySelector(`[data-topic-select="${key}"]`);
+    if (select) loadTopicsFor(id, select);
+  }
 }
 
 $('#chats-list').addEventListener('click', (e) => {
@@ -332,11 +364,11 @@ $('#chats-list').addEventListener('click', (e) => {
     navigator.clipboard.writeText(id);
     toast(`Copied ${id}`);
   } else if (btn.dataset.act === 'src') {
-    document.querySelector('#pair-form [name=source]').value = id;
-    document.querySelector('#oneshot-form [name=source]').value = id;
+    setInputAndLoadTopics(document.querySelector('#pair-form [name=source]'), id);
+    setInputAndLoadTopics(document.querySelector('#oneshot-form [name=source]'), id);
   } else if (btn.dataset.act === 'dst') {
-    document.querySelector('#pair-form [name=dest]').value = id;
-    document.querySelector('#oneshot-form [name=dest]').value = id;
+    setInputAndLoadTopics(document.querySelector('#pair-form [name=dest]'), id);
+    setInputAndLoadTopics(document.querySelector('#oneshot-form [name=dest]'), id);
   }
 });
 
@@ -363,15 +395,21 @@ async function loadPairs() {
     const rows = (data.pairs || []).map(p => {
       const srcLabel = p.source_topic ? `${p.source}/t${p.source_topic}` : p.source;
       const dstLabel = p.dest_topic ? `${p.dest}/t${p.dest_topic}` : p.dest;
+      const pausedBadge = p.paused ? '<span class="pill pill-paused" title="scheduler skips this pair">⏸ paused</span>' : '';
+      const pauseAct = p.paused ? 'resume' : 'pause';
+      const pauseLabel = p.paused ? '▶ resume' : '⏸ pause';
       return `
-      <tr class="border-b last:border-b-0">
-        <td class="py-1.5">${escapeHtml(p.name)}</td>
+      <tr class="border-b last:border-b-0 ${p.paused ? 'opacity-60' : ''}">
+        <td class="py-1.5">${escapeHtml(p.name)} ${pausedBadge}</td>
         <td class="mono text-xs">${srcLabel} -> ${dstLabel}</td>
         <td><span class="pill pill-channel">${p.type}</span></td>
         <td class="mono text-xs">#${p.watermark}</td>
         <td class="text-xs text-slate-500">${p.updated_at ? new Date(p.updated_at*1000).toLocaleString() : '—'}</td>
         <td class="text-right">
           <button data-pair="${escapeHtml(p.name)}" data-act="run" class="text-xs text-blue-600 hover:underline">run</button>
+          <button data-pair="${escapeHtml(p.name)}" data-act="${pauseAct}" class="text-xs text-slate-600 hover:underline ml-2">${pauseLabel}</button>
+          <button data-pair="${escapeHtml(p.name)}" data-act="reset-wm" class="text-xs text-purple-600 hover:underline ml-2" title="reset watermark to 0 — next run starts from beginning">reset wm</button>
+          <button data-pair="${escapeHtml(p.name)}" data-act="gaps" class="text-xs text-emerald-600 hover:underline ml-2" title="scan source for messages not forwarded">find gaps</button>
           <button data-pair="${escapeHtml(p.name)}" data-act="edit" class="text-xs text-amber-600 hover:underline ml-2">edit</button>
           <button data-pair="${escapeHtml(p.name)}" data-act="del" class="text-xs text-rose-600 hover:underline ml-2">delete</button>
         </td>
@@ -388,15 +426,102 @@ $('#pairs-tbody').addEventListener('click', async (e) => {
   if (!btn) return;
   const name = btn.dataset.pair;
   if (btn.dataset.act === 'run') {
+    const p = PAIRS.find(x => x.name === name);
+    const wm = p ? Number(p.watermark || 0) : 0;
+    let body = {};
+    if (wm > 0) {
+      // Pair already has a watermark — let the user choose to resume or restart.
+      const choice = prompt(
+        `Run pair "${name}"\n\n` +
+        `Current watermark: #${wm}\n\n` +
+        `Enter start message id:\n` +
+        `  • leave blank = resume from #${wm}\n` +
+        `  • 0 = full re-forward from the start\n` +
+        `  • any number = start from that id\n\n` +
+        `(Cancel to abort)`,
+        ''
+      );
+      if (choice === null) return; // user cancelled
+      const trimmed = choice.trim();
+      if (trimmed !== '') {
+        const n = parseInt(trimmed, 10);
+        if (isNaN(n) || n < 0) { toast('Invalid id — aborting', false); return; }
+        body = { from_msg_id: n };
+      }
+    }
     btn.disabled = true; btn.textContent = 'running…';
     try {
-      const r = await api(`/api/pairs/${encodeURIComponent(name)}/run`, { method: 'POST' });
+      const r = await api(`/api/pairs/${encodeURIComponent(name)}/run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
       toast(`[${name}] forwarded=${r.result.forwarded} failed=${r.result.failed}`);
       await loadPairs(); await loadRuns();
     } catch (e) {
       toast('Run failed: ' + e.message, false);
     } finally {
       btn.disabled = false; btn.textContent = 'run';
+    }
+  } else if (btn.dataset.act === 'reset-wm') {
+    if (!confirm(`Reset watermark for "${name}" to 0?\n\nNext run will re-forward every message in the source from the beginning. Existing destination messages will be duplicated unless you delete them first.`)) return;
+    btn.disabled = true;
+    try {
+      await api(`/api/pairs/${encodeURIComponent(name)}/watermark`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ last_msg_id: 0 }),
+      });
+      toast(`[${name}] watermark reset to 0`);
+      await loadPairs();
+    } catch (e) {
+      toast('Reset failed: ' + e.message, false);
+    } finally {
+      btn.disabled = false;
+    }
+  } else if (btn.dataset.act === 'gaps') {
+    btn.disabled = true; const orig = btn.textContent; btn.textContent = 'scanning…';
+    try {
+      const r = await api(`/api/pairs/${encodeURIComponent(name)}/gaps`);
+      const trunc = r.missing_truncated ? ' (showing first 1000)' : '';
+      if (r.missing_count === 0) {
+        toast(`[${name}] no gaps — ${r.mapped_count}/${r.source_count} forwarded`);
+      } else if (confirm(
+        `[${name}] gap scan:\n\n` +
+        `  source messages: ${r.source_count}\n` +
+        `  already forwarded: ${r.mapped_count}\n` +
+        `  missing: ${r.missing_count}${trunc}\n\n` +
+        `Forward the missing ones now?\n` +
+        `(first 10 missing ids: ${r.missing.slice(0, 10).join(', ')}${r.missing.length > 10 ? '…' : ''})`
+      )) {
+        const rep = await api(`/api/pairs/${encodeURIComponent(name)}/repair`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ src_ids: r.missing }),
+        });
+        toast(`[${name}] repaired: forwarded=${rep.forwarded} failed=${rep.failed}`);
+        await loadPairs();
+      }
+    } catch (e) {
+      toast('Gap scan failed: ' + e.message, false);
+    } finally {
+      btn.disabled = false; btn.textContent = orig;
+    }
+  } else if (btn.dataset.act === 'pause' || btn.dataset.act === 'resume') {
+    const paused = btn.dataset.act === 'pause';
+    btn.disabled = true;
+    try {
+      await api(`/api/pairs/${encodeURIComponent(name)}/pause`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ paused }),
+      });
+      toast(`[${name}] ${paused ? 'paused' : 'resumed'}`);
+      await loadPairs();
+    } catch (e) {
+      toast('Toggle failed: ' + e.message, false);
+    } finally {
+      btn.disabled = false;
     }
   } else if (btn.dataset.act === 'edit') {
     const p = PAIRS.find(x => x.name === name);
@@ -408,6 +533,12 @@ $('#pairs-tbody').addEventListener('click', async (e) => {
     f.type.value = p.type || 'all';
     f.max_per_run.value = p.max_per_run ?? 200;
     f.delay_seconds.value = p.delay_seconds ?? 1.0;
+    // Format replacements as one rule per line for the textarea.
+    if (f.replacements) {
+      f.replacements.value = (p.replacements || [])
+        .map(r => (r.regex ? 'regex:' : '') + r.find + ' => ' + (r.replace || ''))
+        .join('\n');
+    }
     // Reload topic dropdowns for the chosen source/dest, then set the value
     // once the options exist (loadTopicsFor preserves current value if valid,
     // so we set the value first if cached, otherwise after the fetch).
@@ -428,13 +559,38 @@ $('#pairs-tbody').addEventListener('click', async (e) => {
   }
 });
 
+// Parse one rule per line: "find=>replace" or "regex:pattern=>replace".
+// Returns array of {find, replace, regex} objects suitable for the API.
+function parseReplacements(raw) {
+  const rules = [];
+  for (const line of (raw || '').split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const sep = trimmed.indexOf('=>');
+    if (sep < 0) continue;  // malformed line — silently skip
+    let find = trimmed.slice(0, sep).trim();
+    const replace = trimmed.slice(sep + 2).trim();
+    let regex = false;
+    if (find.toLowerCase().startsWith('regex:')) {
+      find = find.slice(6).trim();
+      regex = true;
+    }
+    if (!find) continue;
+    rules.push({ find, replace, regex });
+  }
+  return rules;
+}
+
 $('#pair-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const fd = new FormData(e.target);
   const body = Object.fromEntries(fd.entries());
+  // Convert the multi-line textarea into a structured replacements array.
+  body.replacements = parseReplacements(body.replacements);
   try {
     const r = await api('/api/pairs', { method: 'POST', body: JSON.stringify(body) });
-    toast(`Pair ${r.action}: ${r.pair.name}`);
+    const nrep = (r.pair.replacements || []).length;
+    toast(`Pair ${r.action}: ${r.pair.name}${nrep ? ' (' + nrep + ' replacements)' : ''}`);
     await loadPairs();
   } catch (e) {
     toast('Save failed: ' + e.message, false);
@@ -535,9 +691,12 @@ wireTopicInputs();
 async function loadJobs() {
   try {
     const data = await api('/api/jobs');
-    const jobs = data.jobs || [];
-    const live = jobs.filter(j => j.status === 'running' || j.status === 'queued').length;
-    $('#jobs-count').textContent = `${live} running, ${jobs.length} total`;
+    const allJobs = data.jobs || [];
+    // Only show running/queued — finished history lives in Recent events.
+    const jobs = allJobs.filter(j => j.status === 'running' || j.status === 'queued');
+    $('#jobs-count').textContent = jobs.length === 0
+      ? 'idle'
+      : `${jobs.length} active`;
     const html = jobs.slice(0, 30).map(j => {
       const pct = j.total ? Math.min(100, Math.round(100 * j.done / j.total)) : 0;
       const pill = {
@@ -569,7 +728,7 @@ async function loadJobs() {
         </div>
       `;
     }).join('');
-    $('#jobs-list').innerHTML = html || '<p class="text-slate-400 text-xs">no jobs yet</p>';
+    $('#jobs-list').innerHTML = html || '<p class="text-slate-400 text-xs">no active jobs — idle</p>';
   } catch (e) {
     /* keep silent — periodic */
   }

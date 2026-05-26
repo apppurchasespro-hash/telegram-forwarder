@@ -43,12 +43,16 @@ from automate import (
     load_message_map,
     lookup_dest_id,
     forget_mappings,
+    mapped_src_ids,
+    record_mappings,
 )
 
 # ───── State ──────────────────────────────────────────────────────────────
 
 app = Quart(__name__)
 app.config["PROVIDE_AUTOMATIC_OPTIONS"] = True
+app.config["TEMPLATES_AUTO_RELOAD"] = True
+app.jinja_env.auto_reload = True
 
 DASH_USER = os.environ.get("DASH_USER", "admin")
 DASH_PASS = os.environ.get("DASH_PASS")  # if unset, auth disabled (local dev only)
@@ -251,9 +255,13 @@ async def api_pairs_post():
         # leave it absent so run_pair's default (True) applies.
         if "drop_author" in body:
             new_pair["drop_author"] = bool(body["drop_author"])
+        # When paused, scheduler skips this pair. Manual runs still work.
+        if "paused" in body:
+            new_pair["paused"] = bool(body["paused"])
         # Optional per-pair text replacements. Schema is a list of
-        # {find, replace, regex?} dicts. Presence of a non-empty list forces
-        # copy-mode for this pair (native forward can't transform content).
+        # {find, replace, regex?} dicts. Pairs with replacements stay on the
+        # native path — run_pair forwards server-side and then edits the dest
+        # caption (parse_mode=None) with apply_replacements(text).
         if "replacements" in body:
             raw = body.get("replacements") or []
             if not isinstance(raw, list):
@@ -306,6 +314,122 @@ async def api_pair_delete(name: str):
     return jsonify({"ok": True, "removed": removed})
 
 
+@app.route("/api/pairs/<name>/pause", methods=["POST"])
+async def api_pair_pause(name: str):
+    """Toggle a pair's paused flag. Body: {"paused": true/false}.
+    Paused pairs are skipped by the scheduler; manual runs still work."""
+    body = await request.get_json(force=True)
+    paused = bool(body.get("paused", True))
+    async with _state_lock:
+        cfg = load_pairs() if _pairs_file_exists() else {"pairs": []}
+        pair = next((p for p in cfg.get("pairs", []) if p.get("name") == name), None)
+        if not pair:
+            return jsonify({"error": f"pair '{name}' not found"}), 404
+        pair["paused"] = paused
+        save_pairs(cfg)
+    _log_event({"kind": "pair_paused" if paused else "pair_unpaused", "pair": name})
+    return jsonify({"ok": True, "pair": name, "paused": paused})
+
+
+@app.route("/api/pairs/<name>/gaps")
+async def api_pair_gaps(name: str):
+    """Scan the source channel and return src msg ids that are NOT in our
+    message_map for this pair — i.e., messages that exist in the source but
+    were never successfully forwarded. Useful for finding what we missed.
+
+    Query: ?limit=N restricts how far back we scan (default: full channel).
+    Returns: {"source_count": N, "mapped_count": M, "missing": [id, ...]}
+    """
+    if not _dl:
+        return jsonify({"error": "telegram client not ready"}), 503
+    cfg = load_pairs() if _pairs_file_exists() else {"pairs": []}
+    pair = next((p for p in cfg.get("pairs", []) if p.get("name") == name), None)
+    if not pair:
+        return jsonify({"error": f"pair '{name}' not found"}), 404
+    limit = request.args.get("limit")
+    limit = int(limit) if limit else None
+    source = pair["source"]
+    ftype = pair.get("type", "all")
+    mapped = mapped_src_ids(name)
+    source_ids: list[int] = []
+    iter_kwargs = {"limit": limit} if limit else {}
+    async for m in _dl.client.iter_messages(source, **iter_kwargs):
+        if not _matches_type(m, ftype, _dl):
+            continue
+        source_ids.append(m.id)
+    source_set = set(source_ids)
+    missing = sorted(source_set - mapped)
+    return jsonify({
+        "source_count": len(source_set),
+        "mapped_count": len(mapped & source_set),
+        "missing_count": len(missing),
+        "missing": missing[:1000],  # cap response size; UI shows count
+        "missing_truncated": len(missing) > 1000,
+    })
+
+
+@app.route("/api/pairs/<name>/repair", methods=["POST"])
+async def api_pair_repair(name: str):
+    """Forward the specific src ids passed in body — bypasses watermark logic.
+    Body: {"src_ids": [123, 456, ...]} — typically the output of /gaps.
+    Uses native batched forward (raw ForwardMessagesRequest) when allowed."""
+    if not _dl:
+        return jsonify({"error": "telegram client not ready"}), 503
+    if _paused:
+        return jsonify({"error": "paused — POST /api/resume first"}), 409
+    body = await request.get_json(force=True)
+    src_ids = body.get("src_ids") or []
+    if not isinstance(src_ids, list) or not src_ids:
+        return jsonify({"error": "src_ids must be a non-empty list"}), 400
+    src_ids = [int(x) for x in src_ids]
+
+    cfg = load_pairs() if _pairs_file_exists() else {"pairs": []}
+    pair = next((p for p in cfg.get("pairs", []) if p.get("name") == name), None)
+    if not pair:
+        return jsonify({"error": f"pair '{name}' not found"}), 404
+    source = pair["source"]
+    dest = pair["dest"]
+    dest_topic = pair.get("dest_topic")
+    drop_author = bool(pair.get("drop_author", True))
+
+    job = _new_job(kind="pair-repair", label=f"pair:{name} (repair {len(src_ids)} msgs)")
+    job["total"] = len(src_ids)
+    job["status"] = "running"
+    _log_event({"kind": "repair_started", "pair": name, "count": len(src_ids), "job_id": job["id"]})
+
+    # Fetch source messages by id (Telethon: get_messages with explicit ids).
+    msgs = await _dl.client.get_messages(source, ids=src_ids)
+    msgs = [m for m in msgs if m is not None]
+    # Batch in 100s — Telegram cap on forwardMessages.
+    ok, fail = 0, 0
+    BATCH = 100
+    for i in range(0, len(msgs), BATCH):
+        if job.get("cancel"):
+            job["status"] = "cancelled"
+            break
+        batch = msgs[i:i + BATCH]
+        try:
+            forwarded = await _dl.forward_batch(source, dest, batch, drop_author=drop_author, top_msg_id=dest_topic)
+            mappings = []
+            for src_msg, fwd in zip(batch, forwarded):
+                if fwd is not None:
+                    ok += 1
+                    mappings.append((src_msg.id, getattr(fwd, "id", None)))
+                else:
+                    fail += 1
+            if mappings:
+                await record_mappings(name, mappings)
+        except Exception as e:
+            print(f"[repair {name}] batch failed: {e}")
+            fail += len(batch)
+        job.update({"done": min(i + BATCH, len(msgs)), "ok": ok, "fail": fail})
+    job["finished_at"] = int(time.time())
+    if job["status"] == "running":
+        job["status"] = "finished"
+    _log_event({"kind": "repair_finished", "pair": name, "ok": ok, "fail": fail, "job_id": job["id"]})
+    return jsonify({"ok": True, "forwarded": ok, "failed": fail, "job_id": job["id"]})
+
+
 @app.route("/api/pairs/<name>/watermark", methods=["POST"])
 async def api_set_watermark(name: str):
     """Manually set a pair's watermark. Body: {"last_msg_id": int}.
@@ -330,8 +454,26 @@ async def api_pair_run(name: str):
     if not pair:
         return jsonify({"error": f"pair '{name}' not found"}), 404
 
+    # Optional one-shot watermark override. POST body `{"from_msg_id": 0}` makes
+    # this run start from the given id (typically 0 for a full re-forward) without
+    # touching the persisted watermark — the next save inside run_pair still
+    # writes the new high-water id, so subsequent runs resume normally.
+    body = {}
+    try:
+        body = await request.get_json(silent=True) or {}
+    except Exception:
+        body = {}
+    override = body.get("from_msg_id")
+
     async with _state_lock:
         state = load_state()
+    if override is not None:
+        try:
+            override_int = int(override)
+            state[name] = {**state.get(name, {}), "last_msg_id": override_int}
+            _log_event({"kind": "watermark_override", "pair": name, "from_msg_id": override_int})
+        except (TypeError, ValueError):
+            return jsonify({"error": "from_msg_id must be an integer"}), 400
     job = _new_job(kind="pair-manual", label=f"pair:{name} (manual)")
     _log_event({"kind": "run_started", "pair": name, "trigger": "manual", "job_id": job["id"]})
     try:
@@ -756,6 +898,10 @@ async def _scheduler_loop():
             for pair in cfg.get("pairs", []):
                 if _paused:
                     break
+                # Per-pair pause: set `"paused": true` in pairs.json to keep a
+                # pair out of the scheduler. Manual /api/pairs/<name>/run still works.
+                if pair.get("paused"):
+                    continue
                 name = _pair_key(pair)
                 job = _new_job(kind="pair-scheduled", label=f"pair:{name} (scheduled)")
                 try:
