@@ -441,6 +441,68 @@ async def api_pair_repair(name: str):
     return jsonify({"ok": True, "forwarded": ok, "failed": fail, "job_id": job["id"]})
 
 
+@app.route("/api/multi-forward", methods=["POST"])
+async def api_multi_forward():
+    """One-shot: index a source channel, dedupe against a dest supergroup
+    across all topics, and forward missing files into topics chosen by regex
+    rules on the filename.
+
+    Body schema:
+        {
+            "source": int,                  # required, e.g. -1001303766825
+            "dest":   int,                  # required, e.g. -1003776591963
+            "rules":  [                     # required, ordered (first match wins)
+                {"pattern": "S\\d+E\\d+|Season \\d+", "topic": 10, "label": "TV show"},
+                ...
+            ],
+            "default_topic": int,           # required — fallback when no rule matches
+            "dry_run": bool,                # optional, default False
+            "skip_dest_index": bool,        # optional, default False (re-use existing dst_msgs)
+            "pair_name": str,               # optional — for message_map; default "multi-<abs(source)>"
+            "drop_author": bool             # optional, default True
+        }
+
+    Returns immediately with {ok, job_id}. Progress visible via /api/jobs.
+    """
+    if not _dl:
+        return jsonify({"error": "telegram client not ready"}), 503
+    if _paused:
+        return jsonify({"error": "paused — POST /api/resume first"}), 409
+    body = await request.get_json(force=True)
+    # Basic validation
+    for k in ("source", "dest", "rules", "default_topic"):
+        if k not in body:
+            return jsonify({"error": f"missing field: {k}"}), 400
+    if not isinstance(body["rules"], list):
+        return jsonify({"error": "rules must be a list"}), 400
+    # Verify regexes compile before we kick off the job — fail fast.
+    from automate_multi import compile_rules, run_multi_forward
+    try:
+        compile_rules(body["rules"])
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    label = f"multi-fwd src={body['source']} → dest={body['dest']}"
+    job = _new_job(kind="multi-forward", label=label)
+    job["status"] = "running"
+
+    async def _run():
+        try:
+            await run_multi_forward(_dl, body, job)
+        except Exception as e:
+            print(f"[multi-fwd] FAILED: {type(e).__name__}: {e}")
+            import traceback; traceback.print_exc()
+            job["status"] = "error"
+            job["error"] = f"{type(e).__name__}: {e}"
+            job["finished_at"] = int(time.time())
+
+    asyncio.create_task(_run())
+    _log_event({"kind": "multi_forward_started", "source": body["source"],
+                "dest": body["dest"], "dry_run": bool(body.get("dry_run")),
+                "job_id": job["id"]})
+    return jsonify({"ok": True, "job_id": job["id"], "db_path": str(job.get("db_path", ""))})
+
+
 @app.route("/api/pairs/<name>/watermark", methods=["POST"])
 async def api_set_watermark(name: str):
     """Manually set a pair's watermark. Body: {"last_msg_id": int}.
