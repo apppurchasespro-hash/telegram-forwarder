@@ -305,7 +305,7 @@ async function api(path, opts = {}) {
 // ── Chats ─────────────────────────────────────────────────────────────
 async function loadChats() {
   try {
-    const data = await api('/api/chats?limit=400');
+    const data = await api('/api/chats?limit=5000');
     CHATS = data.chats || [];
     renderChats();
     setStatus(true, `${CHATS.length} chats loaded`);
@@ -328,7 +328,9 @@ function renderChats() {
     if (!q) return true;
     return normalizeText(c.title).includes(q) || String(c.id).includes(q);
   });
-  const html = filtered.slice(0, 200).map(c => {
+  // When searching, show every match; otherwise cap the unsearched DOM so it stays light.
+  const cap = q ? filtered.length : 500;
+  const html = filtered.slice(0, cap).map(c => {
     const forwardBadge = c.noforwards
       ? '<span class="pill pill-protected" title="noforwards=true — will use copy mode (download + re-upload)">🔒 protected</span>'
       : '<span class="pill pill-forwardable" title="native forward_messages works — fast batched mirror">↗ forwardable</span>';
