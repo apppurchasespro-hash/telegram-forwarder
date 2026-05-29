@@ -321,45 +321,26 @@ curl -u $DASH_USER:$DASH_PASS -X POST $URL/api/pairs/my-pair/watermark \
 
 Internally, per-message watermark saves go through `automate.py::save_pair_watermark`, an atomic read-modify-write of one pair's key under a process-wide lock. This prevents concurrent runners (scheduler + bulk + manual on different pairs) from clobbering each other when each holds a stale full-state snapshot. The save also refuses to write a value LOWER than what's on disk unless `allow_regression=True` (only the repair endpoint sets that flag), so a stale in-flight job cannot zap a manual repair.
 
-### Deploy on Railway (24/7)
+### Deploy on a VPS (24/7)
 
-This repo includes `Dockerfile` and `railway.json` for a one-service deployment that runs both the UI and the scheduler. You can either point Railway at the repo (it builds from source) or at the pre-built GHCR image — the latter is faster and doesn't burn Railway build minutes.
+Production runs on a Tencent Lighthouse VPS as one Docker container per Telegram account (`tg-forwarder`, `tg-forwarder-acct1`, …), each on its own host port with an isolated `data-acctN/` bind mount and `.env-acctN` file. The image is `ghcr.io/apppurchasespro-hash/telegram-forwarder:latest`.
 
-1. **Generate a session string locally** (one-time):
+Full end-to-end runbook (including SDK-based firewall opening and the seeding gotchas): **[`SOP/add-account-to-vps.md`](SOP/add-account-to-vps.md)**.
 
-   ```bash
-   # After logging in locally with the CLI at least once:
-   python convert_session.py > session_string.txt
-   ```
+Required env vars per container:
 
-   Treat `session_string.txt` like a password — it grants full account access.
+| Variable | Value |
+|---|---|
+| `TELEGRAM_API_ID` | from <https://my.telegram.org> |
+| `TELEGRAM_API_HASH` | from <https://my.telegram.org> |
+| `TELETHON_SESSION_STRING` | from `python convert_session.py tg_session_acctN` |
+| `DASH_USER` | username for the web UI Basic Auth |
+| `DASH_PASS` | password for the web UI Basic Auth (set this — if unset, UI is open) |
+| `MSG_MAP_PATH` | `/app/data/message_map.json` (override the default so state survives restarts) |
 
-2. **Create a new Railway project.** Either:
-   - **Deploy from image** (recommended): pick "Deploy from Docker image" and use `ghcr.io/apppurchasespro-hash/telegram-forwarder:latest` (or pin to `:vX.Y.Z`). Zero build time.
-   - **Deploy from repo**: point at `apppurchasespro-hash/telegram-forwarder` and Railway will build the `Dockerfile` itself.
+`STATE_PATH`, `PAIRS_PATH`, `RUN_LOG_PATH` are baked into the Dockerfile and don't need to be set. Optional `PAIRS_JSON` and `INITIAL_WATERMARKS_JSON` seed the data dir on first boot.
 
-3. **Set env vars** in the Railway service:
-
-   | Variable | Value |
-   |---|---|
-   | `TELEGRAM_API_ID` | from <https://my.telegram.org> |
-   | `TELEGRAM_API_HASH` | from <https://my.telegram.org> |
-   | `TELETHON_SESSION_STRING` | contents of `session_string.txt` |
-   | `PAIRS_JSON` *(optional)* | inline JSON pair config; seeds `/app/data/pairs.json` on first boot if missing. After that, manage pairs via the UI. |
-   | `STATE_PATH` | `/app/data/watermarks.json` (set by the Dockerfile already) |
-   | `PAIRS_PATH` | `/app/data/pairs.json` (set by the Dockerfile already) |
-   | `RUN_LOG_PATH` | `/app/data/run_log.json` (set by the Dockerfile already) |
-   | `INITIAL_WATERMARKS_JSON` *(optional)* | seed value applied on first boot if `STATE_PATH` doesn't yet exist — e.g. `{"my-feed":{"last_msg_id":12345}}`. Prevents re-forwarding history when redeploying. |
-   | `DASH_USER` | username for the web UI Basic Auth |
-   | `DASH_PASS` | password for the web UI Basic Auth (set this — if unset, UI is open) |
-
-4. **Add a Railway volume** mounted at `/app/data` so pairs + watermarks + run log survive redeploys.
-
-5. **Expose a public domain.** After the first deploy, run `railway domain` (or use the UI) to generate a `*.up.railway.app` URL.
-
-6. **Deploy.** Tail the logs — you should see `Logged in as: ...` then `server ready` and the UI will be reachable at the public domain. Browser will prompt for `DASH_USER`/`DASH_PASS`.
-
-The container runs `python server.py`, which serves the UI and runs the scheduler in the same process.
+The old Railway config (`railway.json` + a one-shot data backup) has been moved to `archive/railway/` (gitignored). Re-enable it by moving the file back to the repo root — nothing in the codebase depends on its location.
 
 ## Troubleshooting
 

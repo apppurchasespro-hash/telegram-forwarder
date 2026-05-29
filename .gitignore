@@ -18,6 +18,7 @@ data_acct*/
 venv/
 .env
 railway_backup_*/
+archive/
 secrets/
 SOP/
 .DS_Store
