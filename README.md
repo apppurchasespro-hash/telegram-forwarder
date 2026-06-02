@@ -24,7 +24,7 @@ This tool fixes all four:
 
 | Feature | this repo | [tgcf](https://github.com/aahnik/tgcf) | [telemirror](https://github.com/khoben/telemirror) |
 |---|---|---|---|
-| Stars at time of writing | 0 (new) | 1.6k | 303 |
+| Stars at time of writing | 6 | 1.6k | 303 |
 | Last commit (as of 2026-05) | active | Dec 2022 (stale) | active |
 | Atomic concurrent watermark save | ✅ | ⚠ vulnerable | ⚠ vulnerable |
 | OOM-safe streaming on 80k+ channels | ✅ | ❌ builds full list | ❌ builds full list |
@@ -266,6 +266,29 @@ python automate.py
 | `replacements` | no | `[]` | List of `{find, replace, regex?}` rules. Forwards natively + edits caption after — does **not** force copy-mode. |
 
 `RUN_ONCE_AND_EXIT=1 python automate.py` runs one pass and exits — useful for testing or one-shot cron jobs.
+
+## Multi-source analyzer (`scripts/multi_source_analyzer.py`)
+
+Scans N source topics/channels, deduplicates against a main channel, and produces a deterministic forward plan + XLSX report — without forwarding anything. Think of it as a dry-run planner for large-scale channel curation.
+
+**What it does**
+- Indexes N supergroup topics + standalone channels into a local SQLite DB (resumable via `max(msg_id)`)
+- Cross-source deduplication: exact `(file_name, file_size)` match first, then logical `(title, season, episode)` cluster
+- Quality-ranked winner selection across sources: 2160p > 1080p > 720p > 480p > 360p, tiebreaker by file size
+- Source trust scoring: per-source win rate across clusters (shows which sources consistently have the best copies)
+- Forward plan verdicts: `MISSING`, `UPGRADE_QUALITY`, `SKIP_HAVE_EXACT`, `SKIP_HAVE_EQUAL_OR_BETTER`, `SUPPRESSED_DUPE_CROSS_SOURCE`
+- 9-sheet XLSX report: plan, upgrades, per-source stats, source trust, cross-source dupes, unparseable files, and more
+
+```powershell
+python scripts/multi_source_analyzer.py `
+    --sources-config sources.json `
+    --session tg_session `
+    --db data/multi_analysis.db `
+    --report data/multi_analysis.xlsx `
+    --plan data/forward_plan.json
+```
+
+Copy `sources.example.json` → `sources.json` and fill in your channel/topic IDs. Full flag reference: [`SOP/multi-source-analyzer-features.md`](SOP/multi-source-analyzer-features.md).
 
 ## Web UI (`server.py`)
 
