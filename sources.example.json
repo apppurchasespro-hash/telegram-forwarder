@@ -1,0 +1,29 @@
+{
+  "main": -1001234567890,
+  "main_label": "Movies ARENA",
+  "sources": [
+    {
+      "kind": "topic",
+      "supergroup": -1003776591963,
+      "topic_id": 1,
+      "label": "Clone/General"
+    },
+    {
+      "kind": "topic",
+      "supergroup": -1003776591963,
+      "topic_id": 12,
+      "label": "Clone/Hindi"
+    },
+    {
+      "kind": "topic",
+      "supergroup": -1003776591963,
+      "topic_id": 18,
+      "label": "Clone/South"
+    },
+    {
+      "kind": "channel",
+      "id": -1001416240381,
+      "label": "OldChannelA"
+    }
+  ]
+}

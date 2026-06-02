@@ -22,3 +22,6 @@ archive/
 secrets/
 SOP/
 .DS_Store
+sources.json
+.claude/
+bot/
