@@ -1129,11 +1129,29 @@ async def _startup():
     await _dl.start()
     _register_event_handlers()
     # Warm up the entity cache so the scheduler's first run can resolve channel IDs
-    # immediately (a fresh session string has an empty cache).
+    # immediately (a fresh session string has an empty SQLite entity cache).
+    # Step 1: fetch all dialogs (populates most channels).
     try:
-        await _dl.client.get_dialogs()  # no limit — caches all channels so pair IDs resolve immediately
+        await _dl.client.get_dialogs()
     except Exception as e:
-        print(f"[startup] entity warmup failed (non-fatal): {e}", file=sys.stderr)
+        print(f"[startup] get_dialogs warmup failed (non-fatal): {e}", file=sys.stderr)
+    # Step 2: explicitly resolve every source/dest ID in pairs.json so archived
+    # or low-activity channels that fall outside get_dialogs results are cached too.
+    try:
+        pairs_cfg = load_pairs() if _pairs_file_exists() else {}
+        ids = set()
+        for p in pairs_cfg.get("pairs", []):
+            for k in ("source", "dest"):
+                if p.get(k):
+                    ids.add(int(p[k]))
+        for cid in ids:
+            try:
+                await _dl.client.get_input_entity(cid)
+            except Exception:
+                pass
+        print(f"[startup] entity warmup done — {len(ids)} pair channels resolved", file=sys.stderr)
+    except Exception as e:
+        print(f"[startup] pair entity warmup failed (non-fatal): {e}", file=sys.stderr)
     _scheduler_task = asyncio.create_task(_scheduler_loop())
     print(f"server ready — dash_user={DASH_USER!r} auth={'on' if DASH_PASS else 'OFF (set DASH_PASS)'}")
 
