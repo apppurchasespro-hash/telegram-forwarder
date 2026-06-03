@@ -982,7 +982,16 @@ async def _scheduler_loop():
                     continue
             cfg = load_pairs() if _pairs_file_exists() else {"interval_seconds": 3600, "pairs": []}
             interval = max(60, int(cfg.get("interval_seconds", 3600)))
-            for pair in cfg.get("pairs", []):
+            pairs = cfg.get("pairs", [])
+            active = [p for p in pairs if not p.get("paused")]
+            if _paused:
+                print(f"[scheduler] PAUSED — sleeping {interval}s, next check at "
+                      f"{datetime.fromtimestamp(time.time() + interval, tz=timezone.utc).strftime('%H:%M:%S UTC')}",
+                      file=sys.stderr)
+            else:
+                print(f"[scheduler] cycle start — {len(active)} active pair(s), interval={interval}s",
+                      file=sys.stderr)
+            for pair in pairs:
                 if _paused:
                     break
                 # Per-pair pause: set `"paused": true` in pairs.json to keep a
@@ -1003,6 +1012,8 @@ async def _scheduler_loop():
                     job.update({"status": "error", "finished_at": int(time.time())})
                     print(f"scheduler error for {name}: {e}", file=sys.stderr)
                     _log_event({"kind": "run_error", "pair": name, "error": str(e), "trigger": "scheduler", "job_id": job["id"]})
+            next_run = datetime.fromtimestamp(time.time() + interval, tz=timezone.utc).strftime('%H:%M:%S UTC')
+            print(f"[scheduler] cycle done — sleeping {interval}s, next run at {next_run}", file=sys.stderr)
             await asyncio.sleep(interval)
         except asyncio.CancelledError:
             raise
