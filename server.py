@@ -1131,7 +1131,7 @@ async def _startup():
     # Warm up the entity cache so the scheduler's first run can resolve channel IDs
     # immediately (a fresh session string has an empty cache).
     try:
-        await _dl.client.get_dialogs(limit=300)
+        await _dl.client.get_dialogs()  # no limit — caches all channels so pair IDs resolve immediately
     except Exception as e:
         print(f"[startup] entity warmup failed (non-fatal): {e}", file=sys.stderr)
     _scheduler_task = asyncio.create_task(_scheduler_loop())
