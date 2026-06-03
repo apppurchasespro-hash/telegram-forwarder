@@ -184,7 +184,13 @@ async def api_chats():
     if not _dl:
         return jsonify({"error": "telegram client not ready"}), 503
     limit = int(request.args.get("limit", 300))
-    chats = await _dl.list_chats(limit=limit)
+    try:
+        chats = await _dl.list_chats(limit=limit)
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        print(f"[api/chats] ERROR: {type(e).__name__}: {e}\n{tb}", file=sys.stderr)
+        return jsonify({"error": f"{type(e).__name__}: {e}", "detail": tb}), 500
     return jsonify({"chats": chats})
 
 
@@ -966,6 +972,14 @@ async def api_job_cancel(job_id: str):
 async def _scheduler_loop():
     while True:
         try:
+            if _dl and not _dl.client.is_connected():
+                print("[scheduler] client disconnected — reconnecting…", file=sys.stderr)
+                try:
+                    await _dl.client.connect()
+                except Exception as e:
+                    print(f"[scheduler] reconnect failed: {e}", file=sys.stderr)
+                    await asyncio.sleep(30)
+                    continue
             cfg = load_pairs() if _pairs_file_exists() else {"interval_seconds": 3600, "pairs": []}
             interval = max(60, int(cfg.get("interval_seconds", 3600)))
             for pair in cfg.get("pairs", []):
@@ -1114,6 +1128,12 @@ async def _startup():
     _dl = TelegramDownloader(load_config())
     await _dl.start()
     _register_event_handlers()
+    # Warm up the entity cache so the scheduler's first run can resolve channel IDs
+    # immediately (a fresh session string has an empty cache).
+    try:
+        await _dl.client.get_dialogs(limit=300)
+    except Exception as e:
+        print(f"[startup] entity warmup failed (non-fatal): {e}", file=sys.stderr)
     _scheduler_task = asyncio.create_task(_scheduler_loop())
     print(f"server ready — dash_user={DASH_USER!r} auth={'on' if DASH_PASS else 'OFF (set DASH_PASS)'}")
 

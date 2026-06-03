@@ -297,7 +297,9 @@ async function api(path, opts = {}) {
   });
   if (!r.ok) {
     const txt = await r.text();
-    throw new Error(`${r.status}: ${txt}`);
+    let msg = txt;
+    try { const j = JSON.parse(txt); msg = j.error || txt; } catch {}
+    throw new Error(`${r.status}: ${msg}`);
   }
   return r.json();
 }
