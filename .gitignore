@@ -25,3 +25,7 @@ SOP/
 sources.json
 .claude/
 bot/
+searchbot/config.json
+searchbot/catalog.db
+searchbot/catalog.db-wal
+searchbot/catalog.db-shm

@@ -1,0 +1,9 @@
+{
+  "bot_token": "123456:ABC-your-botfather-token",
+  "storage_channel_id": -1003930887639,
+  "force_sub_channel": null,
+  "admins": [123456789],
+  "db_path": "./searchbot/catalog.db",
+  "results_limit": 10,
+  "auto_delete_seconds": 0
+}
