@@ -1,0 +1,25 @@
+# Keep secrets, sessions, big data, and the unrelated web project out of images
+*.session
+*.session-journal
+tg_session*
+config.json
+searchbot/config.json
+searchbot/catalog.db
+searchbot/catalog.db-wal
+searchbot/catalog.db-shm
+secrets/
+data/
+data_acct*/
+data_side/
+downloads/
+temp/
+archive/
+railway_backup_*/
+bot/
+__pycache__/
+*.pyc
+.git/
+.venv/
+venv/
+.claude/
+SOP/

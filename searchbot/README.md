@@ -57,6 +57,43 @@ or extend it later to listen for new posts live.
 - `/stats` *(admin)* — file and user counts.
 - `/broadcast <msg>` *(admin)* — message every known user.
 
+## Deploy (Docker, always-on)
+
+The container runs the **bot only**. Config + catalog are mounted from a
+`/data` volume so secrets and your account session are never baked into the
+image (`.dockerignore` enforces this). Re-index locally and re-upload
+`catalog.db` when you add content.
+
+```bash
+# on the server, from the repo root:
+mkdir -p searchbot/data
+# copy in your two runtime files:
+#   searchbot/data/config.json   (use config.docker.example.json -> db_path "/data/catalog.db")
+#   searchbot/data/catalog.db    (scp the file from your local machine)
+
+docker compose -f searchbot/docker-compose.yml up -d --build
+docker logs -f searchbot          # expect: "bot @… online; catalog has N files"
+```
+
+To refresh the catalog after adding files (run locally, where the Telethon
+session lives), then push the DB up:
+
+```bash
+TELETHON_SESSION_FILE=tg_session python -m searchbot.indexer
+scp searchbot/catalog.db  user@server:/path/repo/searchbot/data/catalog.db
+ssh user@server 'docker restart searchbot'
+```
+
+### On Tencent Cloud
+
+- **Use an international region** (Hong Kong / Singapore / Silicon Valley).
+  Mainland-China regions cannot reach `api.telegram.org` — Telegram is blocked.
+- A **Lighthouse** instance (or a small **CVM**, 1 vCPU / 1–2 GB) with the
+  Docker application image is plenty. Open no inbound ports — the bot uses
+  outbound long-polling only (no webhook).
+- Install Docker, clone the repo, place the two files in `searchbot/data/`,
+  then `docker compose … up -d --build` as above.
+
 ## Notes / next steps
 
 - **Storage engine is swappable.** Everything goes through `db.Catalog`; port

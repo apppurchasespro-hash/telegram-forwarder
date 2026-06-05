@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
@@ -45,7 +46,9 @@ dp = Dispatcher()
 
 
 def load_bot_config() -> dict:
-    path = BASE_DIR / "searchbot" / "config.json"
+    # SEARCHBOT_CONFIG lets the container mount config from a data volume
+    # (e.g. /data/config.json) instead of baking it into the image.
+    path = Path(os.environ.get("SEARCHBOT_CONFIG", str(BASE_DIR / "searchbot" / "config.json")))
     if not path.exists():
         raise FileNotFoundError(
             f"{path} not found — copy searchbot/config.example.json to it and fill it in."

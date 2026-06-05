@@ -1,0 +1,17 @@
+# Run from the repo root:  docker compose -f searchbot/docker-compose.yml up -d --build
+#
+# Put your runtime files in ./searchbot/data/ on the host BEFORE starting:
+#   - config.json   (with "db_path": "/data/catalog.db")
+#   - catalog.db    (scp the 79 MB file up from your local machine)
+services:
+  searchbot:
+    build:
+      context: ..
+      dockerfile: searchbot/Dockerfile
+    image: searchbot:latest
+    container_name: searchbot
+    restart: unless-stopped
+    environment:
+      - SEARCHBOT_CONFIG=/data/config.json
+    volumes:
+      - ./data:/data

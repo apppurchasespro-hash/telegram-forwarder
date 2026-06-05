@@ -35,7 +35,7 @@ HIGH_WATER_KEY = "indexer_high_water"
 
 
 def load_bot_config() -> dict:
-    path = BASE_DIR / "searchbot" / "config.json"
+    path = Path(os.environ.get("SEARCHBOT_CONFIG", str(BASE_DIR / "searchbot" / "config.json")))
     if not path.exists():
         raise FileNotFoundError(
             f"{path} not found — copy searchbot/config.example.json to it and fill it in."
