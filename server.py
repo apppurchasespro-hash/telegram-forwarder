@@ -1118,7 +1118,14 @@ def _register_event_handlers() -> None:
     if not _dl or not _dl.client:
         return
     _dl.client.add_event_handler(_on_source_edited, events.MessageEdited())
-    _dl.client.add_event_handler(_on_source_deleted, events.MessageDeleted())
+    # Delete-propagation is OFF by default: a source channel deleting messages
+    # would otherwise cascade-delete the mirrored copies in the destination
+    # (data-loss risk). Set DELETE_PROPAGATION=1 to re-enable.
+    if os.environ.get("DELETE_PROPAGATION") == "1":
+        _dl.client.add_event_handler(_on_source_deleted, events.MessageDeleted())
+        print("[events] delete-propagation ENABLED (DELETE_PROPAGATION=1)", file=sys.stderr)
+    else:
+        print("[events] delete-propagation disabled (default)", file=sys.stderr)
 
 
 # ───── Lifecycle ──────────────────────────────────────────────────────────
