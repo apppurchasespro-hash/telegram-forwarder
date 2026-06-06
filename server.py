@@ -326,9 +326,15 @@ async def api_pair_delete(name: str):
         cfg["pairs"] = [p for p in cfg.get("pairs", []) if p.get("name") != name]
         save_pairs(cfg)
         removed = before - len(cfg["pairs"])
-        # Don't delete watermark — keeping it means if you re-add the pair you don't re-forward history.
-    _log_event({"kind": "pair_deleted", "pair": name, "removed": removed})
-    return jsonify({"ok": True, "removed": removed})
+        # Also drop the pair's watermark so deletion is a clean slate. NOTE: if
+        # you later re-add a pair with the same name, it will re-forward the
+        # source history from the start (no surviving watermark to resume from).
+        state = load_state()
+        wm_cleared = state.pop(name, None) is not None
+        if wm_cleared:
+            save_state(state)
+    _log_event({"kind": "pair_deleted", "pair": name, "removed": removed, "watermark_cleared": wm_cleared})
+    return jsonify({"ok": True, "removed": removed, "watermark_cleared": wm_cleared})
 
 
 @app.route("/api/pairs/<name>/pause", methods=["POST"])
