@@ -104,11 +104,16 @@
             <span class="block text-xs text-slate-500 mb-1">Type</span>
             <select name="type" class="w-full border border-slate-300 rounded px-2 py-1">
               <option value="all">all (text + media)</option>
+              <option value="videos_and_files">videos + files (incl. caption)</option>
               <option value="docs_and_text">docs + text (skip photo/video)</option>
               <option value="documents">documents only (incl. caption)</option>
               <option value="media">media only (photo/video)</option>
               <option value="messages">text only</option>
             </select>
+          </label>
+          <label class="col-span-2">
+            <span class="block text-xs text-slate-500 mb-1">File extension filter <span class="text-slate-400">(comma-separated, e.g. mkv, mp4, zip — leave blank for all)</span></span>
+            <input name="file_extensions" type="text" placeholder="mkv, mp4, zip" class="w-full border border-slate-300 rounded px-2 py-1 mono text-xs">
           </label>
           <label>
             <span class="block text-xs text-slate-500 mb-1">Max per run <span class="text-slate-400">(0 = unlimited until flood-wait)</span></span>
@@ -186,6 +191,7 @@
             <span class="block text-xs text-slate-500 mb-1">Type</span>
             <select name="type" class="w-full border border-slate-300 rounded px-2 py-1">
               <option value="all">all</option>
+              <option value="videos_and_files">videos + files</option>
               <option value="docs_and_text">docs + text</option>
               <option value="documents">documents</option>
               <option value="media">media</option>
@@ -224,6 +230,7 @@
             <span class="block text-xs text-slate-500 mb-1">Type (applied to all generated pairs)</span>
             <select name="type" class="w-full border border-slate-300 rounded px-2 py-1">
               <option value="all">all</option>
+              <option value="videos_and_files">videos + files</option>
               <option value="docs_and_text">docs + text</option>
               <option value="documents">documents</option>
               <option value="media">media</option>
@@ -542,6 +549,7 @@ $('#pairs-tbody').addEventListener('click', async (e) => {
     f.max_per_run.value = p.max_per_run ?? 200;
     f.delay_seconds.value = p.delay_seconds ?? 1.0;
     if (f.max_file_size_mb) f.max_file_size_mb.value = p.max_file_size_mb ?? 0;
+    if (f.file_extensions) f.file_extensions.value = (p.file_extensions || []).join(', ');
     // Format replacements as one rule per line for the textarea.
     if (f.replacements) {
       f.replacements.value = (p.replacements || [])

@@ -302,7 +302,40 @@ def _matches_type(msg, ftype: str, dl: TelegramDownloader) -> bool:
         # documents (with or without caption) + text-only messages.
         # Skips photos/videos/voice/etc.
         return dl._is_document(msg) or bool(msg.message and not msg.media)
+    if ftype == "videos_and_files":
+        # videos (compressed) + all documents/files, with any caption they carry.
+        # Skips photos, gifs, stickers, voice, text-only.
+        return bool(msg.video or msg.document)
     return False
+
+
+def _doc_ext(msg) -> str:
+    """Lowercase extension (no dot) from a message's document. Falls back to MIME subtype."""
+    import os as _os
+    from telethon.tl.types import DocumentAttributeFilename
+    doc = msg.document
+    if not doc:
+        return ""
+    for attr in (doc.attributes or []):
+        if isinstance(attr, DocumentAttributeFilename) and attr.file_name:
+            _, ext = _os.path.splitext(attr.file_name)
+            if ext:
+                return ext.lstrip(".").lower()
+    mime = doc.mime_type or ""
+    if "/" in mime:
+        sub = mime.split("/")[-1].lower()
+        return {"x-matroska": "mkv", "x-msvideo": "avi", "quicktime": "mov",
+                "x-ms-wmv": "wmv", "x-flv": "flv"}.get(sub, sub)
+    return ""
+
+
+def _matches_extensions(msg, extensions: list) -> bool:
+    """True when extensions is empty, or the message's document extension is in the whitelist."""
+    if not extensions:
+        return True
+    if not msg.document:
+        return True  # not a file — extension filter doesn't apply to photos/text/etc.
+    return _doc_ext(msg) in extensions
 
 
 # Per-pair locks so the bulk runner, scheduler, and manual UI clicks can't
@@ -357,6 +390,7 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
     # apply_replacements(text). Two API calls per changed msg vs a full
     # download+upload — still ~100x faster than copy-mode.
     replacements = pair.get("replacements") or []
+    file_extensions = [e.lower().lstrip(".") for e in (pair.get("file_extensions") or []) if e]
 
     watermark = int(state.get(name, {}).get("last_msg_id", 0))
 
@@ -519,6 +553,8 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                 break
             if not _matches_type(m, ftype, dl):
                 continue
+            if not _matches_extensions(m, file_extensions):
+                continue
             batch.append(m)
             if len(batch) >= BATCH:
                 await _flush_batch()
@@ -549,6 +585,8 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
             job["finished_at"] = int(time.time())
             return {"forwarded": 0, "failed": 0, "last_id": watermark, "cancelled": True}
         if not _matches_type(m, ftype, dl):
+            continue
+        if not _matches_extensions(m, file_extensions):
             continue
         if max_size_bytes > 0:
             sz = _msg_media_size_bytes(m)

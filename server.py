@@ -39,6 +39,7 @@ from automate import (
     run_pair,
     _pair_key,
     _matches_type,
+    _matches_extensions,
     apply_replacements,
     load_message_map,
     lookup_dest_id,
@@ -294,12 +295,21 @@ async def api_pairs_post():
                 })
             if cleaned:
                 new_pair["replacements"] = cleaned
+        if "file_extensions" in body:
+            raw = body.get("file_extensions") or []
+            if isinstance(raw, str):
+                raw = [e.strip() for e in raw.replace(",", " ").split() if e.strip()]
+            if not isinstance(raw, list):
+                return jsonify({"error": "file_extensions must be a list or comma-separated string"}), 400
+            cleaned_ext = [e.lower().lstrip(".") for e in raw if isinstance(e, str) and e.strip()]
+            if cleaned_ext:
+                new_pair["file_extensions"] = cleaned_ext
         # Drop nulls so JSON stays clean for users who don't use topics.
         new_pair = {k: v for k, v in new_pair.items() if v is not None}
     except (KeyError, ValueError, TypeError) as e:
         return jsonify({"error": f"invalid pair: {e}"}), 400
 
-    if new_pair["type"] not in ("all", "media", "documents", "messages", "docs_and_text"):
+    if new_pair["type"] not in ("all", "media", "documents", "messages", "docs_and_text", "videos_and_files"):
         return jsonify({"error": "type must be one of all|media|documents|messages|docs_and_text"}), 400
 
     async with _state_lock:
@@ -373,11 +383,14 @@ async def api_pair_gaps(name: str):
     limit = int(limit) if limit else None
     source = pair["source"]
     ftype = pair.get("type", "all")
+    file_extensions = [e.lower().lstrip(".") for e in (pair.get("file_extensions") or []) if e]
     mapped = mapped_src_ids(name)
     source_ids: list[int] = []
     iter_kwargs = {"limit": limit} if limit else {}
     async for m in _dl.client.iter_messages(source, **iter_kwargs):
         if not _matches_type(m, ftype, _dl):
+            continue
+        if not _matches_extensions(m, file_extensions):
             continue
         source_ids.append(m.id)
     source_set = set(source_ids)
@@ -917,8 +930,8 @@ async def api_clone_forum():
     except (KeyError, ValueError, TypeError) as e:
         return jsonify({"error": f"invalid params: {e}"}), 400
 
-    if ftype not in ("all", "media", "documents", "messages", "docs_and_text"):
-        return jsonify({"error": "type must be one of all|media|documents|messages|docs_and_text"}), 400
+    if ftype not in ("all", "media", "documents", "messages", "docs_and_text", "videos_and_files"):
+        return jsonify({"error": "type must be one of all|media|documents|messages|docs_and_text|videos_and_files"}), 400
 
     job = _new_job(kind="clone-forum", label=f"clone {source} -> {dest_title!r}")
     job["status"] = "running"
