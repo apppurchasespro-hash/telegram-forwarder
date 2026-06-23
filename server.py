@@ -310,7 +310,7 @@ async def api_pairs_post():
         return jsonify({"error": f"invalid pair: {e}"}), 400
 
     if new_pair["type"] not in ("all", "media", "documents", "messages", "docs_and_text", "videos_and_files"):
-        return jsonify({"error": "type must be one of all|media|documents|messages|docs_and_text"}), 400
+        return jsonify({"error": "type must be one of all|media|documents|messages|docs_and_text|videos_and_files"}), 400
 
     async with _state_lock:
         cfg = load_pairs() if _pairs_file_exists() else {"interval_seconds": 3600, "pairs": []}
